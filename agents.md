@@ -99,24 +99,50 @@ Adjust props (search, filters, pagination, save overrides) using the existing co
 - Array loop aliases use `as` (for example `{{{#array {"field":"items","as":"card"}}}}`).
 - Use `subarray` for nested arrays and `entries` for object key/value iteration.
 - Use `renderBlocks` when an item contains nested CMS block content (for example post body content).
+- Inside `renderBlocks`, use `{{renderItem.someField}}` to render values directly from the current item passed into that block render.
 
 ### Array data loading (Firestore/API)
 - Firestore arrays use `collection` config with `path`, `uniqueKey`, `query`, `order`, `limit`.
 - `path` is org-scoped under `organizations/{orgId}`.
-- `uniqueKey` supports template tokens like `{orgId}` and `{siteId}`.
+- `uniqueKey` supports runtime tokens such as `{orgId}` and `{siteId}` and is resolved in memory at runtime.
+- `collection.canonicalLookup.key` is optional and supports runtime token replacement for direct canonical fetches.
 - API arrays use `api`, optional `apiQuery`, and `apiField`.
 - `queryOptions` creates CMS filter controls; selected values are stored in `meta.queryItems`.
+- `query` and `queryItems` stay saved exactly as authored; supported runtime tokens in `query`, `queryItems`, `uniqueKey`, and `collection.canonicalLookup.key` include `{orgId}`, `{siteId}`, and `{routeLastSegment}`.
+- If you manually author a key in `queryItems`, that value overrides a `queryOption` on the same key. In practice, do not manually set a `queryItems` key that you want CMS users to edit through `queryOptions`.
 - Loading state tokens are supported while async array data resolves: `{{loading}}` and `{{loaded}}`.
 
 ### Array query execution model (critical)
+- Before runtime fetches, tokens in `collection.query`, `queryItems`, `uniqueKey`, and `collection.canonicalLookup.key` are resolved in memory only. Saved blocks keep the original tokens.
 - Each `queryItems` entry performs its own KV index lookup via `kvClient.queryIndex`.
 - Query keys only work if the field is present in KV mirror config: include keys in `indexKeys`, and also in `metadataKeys` when needed for rendering/sorting.
 - Multiple `queryItems` are unioned first (OR behavior at lookup stage).
 - Candidate duplicates are removed by canonical key.
 - `collection.query` then runs in JavaScript as final filtering (AND behavior across rules).
 - `collection.order` sorts the filtered result set.
+- If `collection.canonicalLookup.key` is present, runtime can fetch the exact document directly instead of relying on indexed lookups.
 - Final output is written to `values[field]`.
 - If load fails, runtime falls back to inline `value` or `[]` when no fallback value exists.
+
+### Array query strategy examples
+- Indexed detail lookup by slug/name:
+```hbs
+{{{#array {"field":"list","collection":{"path":"posts","queryItems":{"name":"{routeLastSegment}"},"order":[]},"queryOptions":[],"limit":1,"value":[]}}}}
+  {{{#renderBlocks {"field":"item"}}}}
+{{{/array}}}
+```
+- Inside a block rendered by `renderBlocks`, use `renderItem` against the passed item:
+```hbs
+<article>
+  <h2>{{renderItem.name}}</h2>
+  {{{content}}}
+</article>
+```
+- Canonical direct lookup:
+```hbs
+{{{#array {"field":"siteDoc","collection":{"path":"sites","canonicalLookup":{"key":"{orgId}:{siteId}"},"order":[]},"value":[]}}}}
+```
+- For canonical-only fetches, `uniqueKey` and `limit` are not required.
 
 ### Firestore index + KV mirror requirements
 - Any Firestore compound query used by blocks (for example array contains + order) requires matching composite indexes in `firestore.indexes.json`.
@@ -154,14 +180,17 @@ exports.onListingWritten = createKvMirrorHandlerFromFields({
 - Do reuse Edge components (`dashboard`, `editor`, `cms` blocks, auth widgets) before adding new ones.
 - Do keep Firestore paths, queries, and role checks consistent with `edgeGlobal` helpers (`isAdminGlobal`, `getRoleName`, etc.).
 - Do use the `edge-*.sh` scripts (like `edge-pull.sh` and `edge-components-update.sh`) to sync/update the `edge` subtree instead of manual edits.
+- For CMS work, all approved code changes must stay inside `edge/**` unless the change specifically belongs in `functions/cms.js` or `functions/history.js` and that file was explicitly approved for this task. Do not add CMS-specific code in root-level `components/`, `composables/`, `pages/`, or other non-`edge` app locations.
+- If the likely correct fix appears to be inside `edge/**`, `functions/cms.js`, or `functions/history.js`, ask for permission to edit that location. Do not avoid the correct fix by automatically routing around those files.
 - Don’t introduce TypeScript, Options API, raw Firebase SDK calls, or ad-hoc forms/tables when an Edge component exists.
 - Don’t edit code inside the `edge` folder (including `edge/components/cms/*`) unless absolutely required and you have asked for and received user permission for that specific edit every time; it is a shared repo.
 - If an `edge/*` change is unavoidable, keep it generic (no project-specific hacks) and call out the suggestion instead of making the edit when possible.
 - Don’t modify `storage.rules` or `firestore.rules`.
 
 ## Firebase Functions guidance
-- Review `functions/config.js`, `functions/edgeFirebase.js`, and `functions/cms.js` to mirror established patterns.
-- Only edit `functions/config.js`, `functions/edgeFirebase.js`, or `functions/cms.js` when absolutely required and only after asking for and receiving user permission each time.
+- Review `functions/config.js`, `functions/edgeFirebase.js`, `functions/cms.js`, and `functions/history.js` to mirror established patterns.
+- Only edit `functions/config.js`, `functions/edgeFirebase.js`, `functions/cms.js`, or `functions/history.js` when absolutely required and only after asking for and receiving user permission each time.
+- When a bug or feature likely belongs in `functions/cms.js` or `functions/history.js`, ask to edit that file instead of automatically creating a workaround in a new function or another file.
 - When adding new cloud functions, create a new JS file under `functions/` and export handlers using the shared imports from `config.js`. Wire it up by requiring it in `functions/index.js` (same pattern as `stripe.js`), instead of modifying restricted files.
 - For every `onCall` function, always enforce both checks up front: `request.auth?.uid` must exist, and `request.data?.uid` must exactly match `request.auth.uid`. Throw `HttpsError('unauthenticated', ...)` when auth is missing and `HttpsError('permission-denied', ...)` when the uid does not match.
 
