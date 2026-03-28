@@ -1,6 +1,6 @@
 <script setup lang="js">
 import { useVModel } from '@vueuse/core'
-import { File, FileCheck, FileCog, FileDown, FileMinus2, FilePen, FilePlus2, FileUp, FileWarning, FileX, Folder, FolderMinus, FolderOpen, FolderPen, FolderPlus, Link } from 'lucide-vue-next'
+import { Download, ExternalLink, File, FileCheck, FileCog, FileDown, FileMinus2, FilePen, FilePlus2, FileUp, FileWarning, FileX, Folder, FolderMinus, FolderOpen, FolderPen, FolderPlus, History, Link } from 'lucide-vue-next'
 import { toTypedSchema } from '@vee-validate/zod'
 import * as z from 'zod'
 import { useStructuredDataTemplates } from '@/edge/composables/structuredDataTemplates'
@@ -49,8 +49,8 @@ const emit = defineEmits(['update:modelValue', 'pageSettingsUpdate'])
 const ROOT_MENUS = ['Site Root', 'Not In Menu']
 const router = useRouter()
 const modelValue = useVModel(props, 'modelValue', emit)
-const route = useRoute()
 const edgeFirebase = inject('edgeFirebase')
+const { saveJsonFile } = useJsonFileSave()
 const { buildPageStructuredData } = useStructuredDataTemplates()
 
 const isExternalLinkEntry = entry => entry?.item && typeof entry.item === 'object' && entry.item.type === 'external'
@@ -175,11 +175,79 @@ const orderedMenus = computed(() => {
   return menuEntries.sort((a, b) => priority(a.name) - priority(b.name) || a.originalIndex - b.originalIndex)
 })
 
+const normalizeDomain = (value) => {
+  if (!value)
+    return ''
+  let normalized = String(value).trim().toLowerCase()
+  if (!normalized)
+    return ''
+  if (normalized.includes('://')) {
+    try {
+      normalized = new URL(normalized).host
+    }
+    catch {
+      normalized = normalized.split('://').pop() || normalized
+    }
+  }
+  normalized = normalized.split('/')[0] || ''
+  return normalized.replace(/\.+$/g, '')
+}
+
+const normalizePathSlug = value => String(value || '').trim().toLowerCase()
+
+const firstValidDomain = (domains) => {
+  if (!Array.isArray(domains))
+    return ''
+  for (const domain of domains) {
+    const normalized = normalizeDomain(domain)
+    if (normalized)
+      return normalized
+  }
+  return ''
+}
+
+const liveSiteOrigin = computed(() => {
+  if (props.isTemplateSite)
+    return ''
+  const publishedDomains = edgeFirebase.data?.[`${edgeGlobal.edgeState.organizationDocPath}/published-site-settings`]?.[props.site]?.domains
+  const draftDomains = edgeFirebase.data?.[`${edgeGlobal.edgeState.organizationDocPath}/sites`]?.[props.site]?.domains
+  const host = firstValidDomain(publishedDomains) || firstValidDomain(draftDomains)
+  return host ? `https://${host}` : ''
+})
+
+const buildLivePageUrl = (menuName, pageEntry) => {
+  const origin = liveSiteOrigin.value
+  if (!origin)
+    return ''
+  const pageSlug = normalizePathSlug(pageEntry?.name)
+  if (!pageSlug)
+    return ''
+
+  const menuSlug = normalizePathSlug(menuName)
+  const folderSlug = ROOT_MENUS.includes(menuName) ? '' : menuSlug
+
+  if (!folderSlug && pageSlug === 'home')
+    return `${origin}/`
+
+  const segments = folderSlug ? [folderSlug, pageSlug] : [pageSlug]
+  return `${origin}/${segments.map(segment => encodeURIComponent(segment)).join('/')}`
+}
+
 const pageRouteBase = computed(() => {
   return props.site === 'templates'
     ? '/app/dashboard/templates'
     : `/app/dashboard/sites/${props.site}`
 })
+
+const openPageVersions = (pageId) => {
+  const nextPageId = String(pageId || '').trim()
+  if (!nextPageId)
+    return
+  router.push({
+    path: `${pageRouteBase.value}/${nextPageId}`,
+    query: { history: '1' },
+  })
+}
 
 const isPublishedPageDiff = (pageId) => {
   const publishedPage = edgeFirebase.data?.[`${edgeGlobal.edgeState.organizationDocPath}/sites/${props.site}/published`]?.[pageId]
@@ -269,9 +337,12 @@ const state = reactive({
     },
   },
   hasErrors: false,
+  addPageTab: 'templates',
   templateFilter: 'quick-picks',
   selectedTemplateId: 'blank',
+  selectedExistingPageId: '',
   showTemplatePicker: false,
+  templateManualTags: [],
 })
 
 const templateTagItems = computed(() => {
@@ -289,16 +360,60 @@ const templateTagItems = computed(() => {
       }
     }
   }
+  for (const tag of state.templateManualTags) {
+    const normalized = typeof tag === 'string' ? tag.trim() : ''
+    if (normalized && normalized.toLowerCase() !== 'quick picks')
+      tags.add(normalized)
+  }
   const tagList = Array.from(tags).sort((a, b) => a.localeCompare(b)).map(tag => ({ name: tag, title: tag }))
   return [{ name: 'Quick Picks', title: 'Quick Picks' }, ...tagList]
 })
+
+const addTemplateTagOption = (value) => {
+  const normalized = String(value || '').trim()
+  if (!normalized)
+    return
+  if (!state.templateManualTags.includes(normalized))
+    state.templateManualTags.push(normalized)
+}
+
+const getPageDocDefaults = () => ({
+  name: '',
+  type: ['Page'],
+  content: [],
+  postContent: [],
+  structure: [],
+  postStructure: [],
+  metaTitle: '',
+  metaDescription: '',
+  structuredData: buildPageStructuredData(),
+})
+
+const exportPage = async (pageId) => {
+  const docId = String(pageId || '').trim()
+  if (!docId) {
+    edgeFirebase?.toast?.error?.('Save this page before exporting.')
+    return
+  }
+  const doc = existingPagesCollection.value?.[docId]
+  if (!doc) {
+    edgeFirebase?.toast?.error?.(`Could not find page "${docId}" to export.`)
+    return
+  }
+  const exportPayload = { ...getPageDocDefaults(), ...doc, docId }
+  const saved = await saveJsonFile(exportPayload, `page-${docId}.json`)
+  if (saved)
+    edgeFirebase?.toast?.success?.(`Exported page "${docId}".`)
+}
 
 const BLANK_TEMPLATE_ID = 'blank'
 
 const resetAddPageDialogState = () => {
   state.newPageName = ''
+  state.addPageTab = 'templates'
   state.templateFilter = 'quick-picks'
   state.selectedTemplateId = BLANK_TEMPLATE_ID
+  state.selectedExistingPageId = ''
   state.showTemplatePicker = false
 }
 
@@ -334,15 +449,47 @@ const templatePagesCollection = computed(() => {
   return edgeFirebase.data?.[TEMPLATE_COLLECTION_PATH.value] || {}
 })
 
+const normalizeTemplatePageTypes = (value) => {
+  const rawTypes = Array.isArray(value) ? value : [value]
+  const normalized = rawTypes
+    .map((typeValue) => {
+      if (typeValue && typeof typeValue === 'object') {
+        const objectValue = typeValue.name ?? typeValue.value ?? typeValue.title ?? typeValue.label ?? ''
+        return String(objectValue || '')
+      }
+      return String(typeValue || '')
+    })
+    .map(typeValue => typeValue.trim().toLowerCase())
+    .flatMap((typeValue) => {
+      if (typeValue === 'page')
+        return ['Page']
+      if (typeValue === 'post')
+        return ['Post']
+      if (typeValue === 'both')
+        return ['Page', 'Post']
+      return []
+    })
+
+  const uniqueNormalized = [...new Set(normalized)]
+  return uniqueNormalized.length ? uniqueNormalized : ['Page']
+}
+
 const templatePagesList = computed(() => {
-  return Object.entries(templatePagesCollection.value).map(([docId, doc]) => ({
-    docId,
-    ...(doc || {}),
-    name: doc?.name || 'Untitled Template',
-    tags: Array.isArray(doc?.tags) ? doc.tags : [],
-    description: doc?.metaDescription || doc?.description || '',
-    content: Array.isArray(doc?.content) ? doc.content : [],
-  }))
+  return Object.entries(templatePagesCollection.value)
+    .map(([docId, doc]) => ({
+      docId,
+      ...(doc || {}),
+      name: doc?.name || 'Untitled Template',
+      tags: Array.isArray(doc?.tags) ? doc.tags : [],
+      description: doc?.metaDescription || doc?.description || '',
+      content: Array.isArray(doc?.content) ? doc.content : [],
+      type: normalizeTemplatePageTypes(doc?.type),
+    }))
+    .filter((template) => {
+      if (props.isTemplateSite)
+        return true
+      return template.type.includes('Page')
+    })
 })
 
 const templateFilterOptions = computed(() => {
@@ -391,6 +538,11 @@ watch(filteredTemplates, (templates) => {
     state.selectedTemplateId = BLANK_TEMPLATE_ID
 })
 
+watch(() => props.isTemplateSite, (isTemplateSite) => {
+  if (isTemplateSite && state.addPageTab === 'existing')
+    state.addPageTab = 'templates'
+}, { immediate: true })
+
 const blankTemplateTile = {
   docId: BLANK_TEMPLATE_ID,
   name: 'Blank Page',
@@ -402,6 +554,38 @@ const blankTemplateTile = {
 const templateGridItems = computed(() => {
   return [blankTemplateTile, ...filteredTemplates.value]
 })
+
+const existingPagesCollection = computed(() => {
+  return edgeFirebase.data?.[`${edgeGlobal.edgeState.organizationDocPath}/sites/${props.site}/pages`] || {}
+})
+
+const canDuplicateExistingPages = computed(() => !props.isTemplateSite)
+
+const existingPagesList = computed(() => {
+  if (!canDuplicateExistingPages.value)
+    return []
+  return Object.entries(existingPagesCollection.value)
+    .map(([docId, doc]) => ({
+      docId,
+      ...(doc || {}),
+      name: doc?.name || docId || 'Untitled Page',
+      tags: Array.isArray(doc?.tags) ? doc.tags : [],
+      description: doc?.metaDescription || doc?.description || '',
+      content: Array.isArray(doc?.content) ? doc.content : [],
+    }))
+    .sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')))
+})
+
+const selectedExistingPage = computed(() => {
+  return existingPagesList.value.find(page => page.docId === state.selectedExistingPageId) || null
+})
+
+watch(existingPagesList, (pages) => {
+  const selectedPageId = String(state.selectedExistingPageId || '').trim()
+  const hasSelectedPageId = pages.some(page => page.docId === selectedPageId)
+  if (!selectedPageId || !hasSelectedPageId)
+    state.selectedExistingPageId = pages?.[0]?.docId || ''
+}, { immediate: true, deep: true })
 
 const hasValidNewPageName = computed(() => !!(state.newPageName && state.newPageName.trim().length))
 
@@ -627,6 +811,12 @@ const selectTemplate = (templateId) => {
 
 const isTemplateSelected = templateId => state.selectedTemplateId === templateId
 
+const selectExistingPage = (pageId) => {
+  state.selectedExistingPageId = pageId
+}
+
+const isExistingPageSelected = pageId => state.selectedExistingPageId === pageId
+
 const getTemplateDoc = (templateId) => {
   if (templateId === BLANK_TEMPLATE_ID)
     return null
@@ -785,7 +975,7 @@ const renameFolderOrPageAction = async () => {
   }
 
   let renamed = false
-  for (const [menuName, items] of Object.entries(modelValue.value)) {
+  for (const [_menuName, items] of Object.entries(modelValue.value)) {
     for (const item of items) {
       if (typeof item.item === 'string' && item.item === targetDocId) {
         const results = await edgeFirebase.changeDoc(`${edgeGlobal.edgeState.organizationDocPath}/sites/${props.site}/pages`, targetDocId, { name: newSlug })
@@ -825,8 +1015,11 @@ const addPageAction = async () => {
     modelValue.value[state.menuName].push({ menuTitle: state.newPageName, item: { [slug]: [] } })
   }
   else {
-    const templateDoc = getTemplateDoc(state.selectedTemplateId)
-    const payload = buildPagePayloadFromTemplate(templateDoc, slug)
+    const shouldDuplicateExistingPage = state.addPageTab === 'existing' && canDuplicateExistingPages.value
+    const sourcePageDoc = shouldDuplicateExistingPage
+      ? selectedExistingPage.value
+      : getTemplateDoc(state.selectedTemplateId)
+    const payload = buildPagePayloadFromTemplate(sourcePageDoc, slug)
     const result = await edgeFirebase.storeDoc(`${edgeGlobal.edgeState.organizationDocPath}/sites/${props.site}/pages`, payload)
     const docId = result?.meta?.docId
     if (docId) {
@@ -913,13 +1106,13 @@ const deletePageAction = async () => {
   if (props.page === state.deletePage.item) {
     router.replace(pageRouteBase.value)
   }
-  for (const [menuName, items] of Object.entries(modelValue.value)) {
+  for (const [_menuName, items] of Object.entries(modelValue.value)) {
     for (const item of items) {
       if (typeof item.item === 'string' && item.item === state.deletePage.item) {
         item.name = 'Deleting...'
       }
       if (typeof item.item === 'object') {
-        for (const [subMenuName, subItems] of Object.entries(item.item)) {
+        for (const [_subMenuName, subItems] of Object.entries(item.item)) {
           for (const subItem of subItems) {
             if (typeof subItem.item === 'string' && subItem.item === state.deletePage.item) {
               subItem.name = 'Deleting...'
@@ -1003,6 +1196,22 @@ const onSubmit = () => {
     state.pageSettings = false
   }
 }
+
+defineExpose({
+  openPageSettings: showPageSettings,
+  openDeletePageDialog: deletePageShow,
+  openRenamePageDialog: renameFolderOrPageShow,
+  exportPage,
+  publishPage,
+  unPublishPage,
+  discardPageChanges,
+  buildLivePageUrl,
+  isPublishedPageDiff,
+  isPublishedPage: isPublished,
+  isRenameDisabled,
+  isDeleteDisabled,
+})
+
 const theme = computed(() => {
   const theme = edgeFirebase.data?.[`${edgeGlobal.edgeState.organizationDocPath}/sites`]?.[props.site]?.theme || ''
   console.log(`${edgeGlobal.edgeState.organizationDocPath}/sites/${props.site}`)
@@ -1021,22 +1230,22 @@ const theme = computed(() => {
   <SidebarMenuItem v-for="({ menu, name: menuName }) in orderedMenus" :key="menuName">
     <SidebarMenuButton class="group !px-0 hover:!bg-transparent">
       <FolderOpen
-        class="mr-2 group-hover:text-foreground"
+        class="mr-2 text-slate-700 dark:text-slate-200 group-hover:text-slate-900 dark:group-hover:text-white"
       />
-      <span v-if="!props.isTemplateSite" class="!text-foreground">{{ displayMenuName(menuName) }}</span>
+      <span v-if="!props.isTemplateSite" class="text-slate-900 dark:text-slate-100">{{ displayMenuName(menuName) }}</span>
       <SidebarGroupAction class="absolute right-2 top-0 hover:!bg-transparent">
         <DropdownMenu>
           <DropdownMenuTrigger as-child>
-            <SidebarMenuAction class="hover:bg-primary text-foreground hover:text-primary-foreground">
+            <SidebarMenuAction class="hover:bg-slate-100 text-slate-900 hover:text-slate-900 dark:text-slate-100 dark:hover:bg-slate-800 dark:hover:text-slate-100">
               <PlusIcon />
             </SidebarMenuAction>
           </DropdownMenuTrigger>
           <DropdownMenuContent side="right" align="start">
             <DropdownMenuLabel v-if="props.prevMenu" class="flex items-center gap-2">
-              <Folder class="w-5 h-5" /> {{ ROOT_MENUS.includes(props.prevMenu) ? '' : props.prevMenu }}/{{ menuName }}/
+              <Folder class="w-5 h-5 text-slate-700 dark:text-slate-200" /> {{ ROOT_MENUS.includes(props.prevMenu) ? '' : props.prevMenu }}/{{ menuName }}/
             </DropdownMenuLabel>
             <DropdownMenuLabel v-else class="flex items-center gap-2">
-              <Folder class="w-5 h-5" /> {{ ROOT_MENUS.includes(menuName) ? '' : menuName }}/
+              <Folder class="w-5 h-5 text-slate-700 dark:text-slate-200" /> {{ ROOT_MENUS.includes(menuName) ? '' : menuName }}/
             </DropdownMenuLabel>
             <DropdownMenuSeparator />
             <DropdownMenuItem @click="addPageShow(menuName, false)">
@@ -1090,7 +1299,7 @@ const theme = computed(() => {
                 :class="{ 'text-gray-400': element.item === '' }"
                 as-child
                 :is-active="!isExternalLinkEntry(element) && element.item === props.page"
-                class="text-foreground hover:bg-primary hover:text-primary-foreground"
+                class="text-slate-900 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-100 dark:hover:bg-slate-800 dark:hover:text-slate-100"
               >
                 <NuxtLink
                   v-if="!isExternalLinkEntry(element)"
@@ -1100,6 +1309,7 @@ const theme = computed(() => {
                   :to="`${pageRouteBase}/${element.item}`"
                 >
                   <Loader2 v-if="element.item === '' || element.name === 'Deleting...'" :class="{ '!text-red-500': element.name === 'Deleting...' }" class="w-4 h-4 animate-spin" />
+                  <FileX v-else-if="!props.isTemplateSite && !isPublished(element.item)" class="!text-slate-500 dark:!text-slate-300" />
                   <FileWarning v-else-if="isPublishedPageDiff(element.item) && !props.isTemplateSite" class="!text-yellow-600" />
                   <FileCheck v-else class="text-xs !text-green-700 font-normal" />
                   <span>{{ displayEntryName(element) }}</span>
@@ -1118,7 +1328,7 @@ const theme = computed(() => {
               <div class="absolute right-0 -top-0.5">
                 <DropdownMenu>
                   <DropdownMenuTrigger as-child>
-                    <SidebarMenuAction class="hover:bg-primary text-foreground hover:text-primary-foreground">
+                    <SidebarMenuAction class="hover:bg-slate-100 text-slate-900 hover:text-slate-900 dark:text-slate-100 dark:hover:bg-slate-800 dark:hover:text-slate-100">
                       <MoreHorizontal />
                     </SidebarMenuAction>
                   </DropdownMenuTrigger>
@@ -1137,6 +1347,27 @@ const theme = computed(() => {
                           <span>Settings</span>
                           <span v-if="edgeGlobal.edgeState.cmsPageWithUnsavedChanges === element.item" class="text-xs text-red-500">(Unsaved Changes)</span>
                         </div>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        v-if="!props.isTemplateSite && buildLivePageUrl(menuName, element)"
+                        as-child
+                      >
+                        <a :href="buildLivePageUrl(menuName, element)" target="_blank" rel="noopener noreferrer">
+                          <ExternalLink />
+                          <span>View Live Page</span>
+                        </a>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem v-else-if="!props.isTemplateSite" disabled>
+                        <ExternalLink />
+                        <span>View Live Page</span>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem @click="openPageVersions(element.item)">
+                        <History />
+                        <span>Versions</span>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem @click="exportPage(element.item)">
+                        <Download />
+                        <span>Export Page</span>
                       </DropdownMenuItem>
                       <DropdownMenuItem v-if="!props.isTemplateSite && isPublishedPageDiff(element.item)" @click="publishPage(element.item)">
                         <FileUp />
@@ -1243,91 +1474,182 @@ const theme = computed(() => {
             Add page to "{{ state.menuName }}"
           </DialogTitle>
           <DialogDescription>
-            Choose a template or start with a blank page. You can always customize it later.
+            Choose a template or start from an existing page. You can always customize it later.
           </DialogDescription>
         </DialogHeader>
-        <div>
+        <div class="flex min-h-0 flex-1 flex-col">
           <div class="w-full space-y-4">
             <edge-shad-input v-model="state.newPageName" name="name" label="Page Name" placeholder="Enter page name" />
-            <edge-shad-select
-              v-model="state.templateFilter"
-              label="Template Tags"
-              :items="templateFilterOptions"
-              item-title="label"
-              item-value="value"
-              placeholder="Select tag"
-            />
-            <p class="text-xs text-muted-foreground">
-              Filter templates by tag or choose Quick Picks for the most commonly used layouts.
-            </p>
           </div>
-          <edge-button-divider class="my-4">
-            <span class="text-xs text-muted-foreground !nowrap text-center">Select Template</span>
-          </edge-button-divider>
-          <div class="overflow-y-auto !h-[calc(100vh-510px)] pr-1">
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 auto-rows-fr pb-2">
-              <button
-                v-for="template in templateGridItems"
-                :key="template.docId"
-                type="button"
-                class="rounded-lg border bg-card text-left p-3 flex flex-col gap-3 transition focus:outline-none focus-visible:ring-2"
-                :class="isTemplateSelected(template.docId) ? 'border-primary ring-2 ring-primary/50 shadow-lg' : 'border-border hover:border-primary/40'"
-                :aria-pressed="isTemplateSelected(template.docId)"
-                @click="selectTemplate(template.docId)"
+
+          <Tabs v-model="state.addPageTab" class="mt-4 flex min-h-0 flex-1 flex-col">
+            <TabsList class="grid w-full grid-cols-2 rounded-sm border border-slate-300 bg-slate-200 dark:border-slate-700 dark:bg-slate-800">
+              <TabsTrigger value="templates" class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900">
+                Templates
+              </TabsTrigger>
+              <TabsTrigger
+                value="existing"
+                :disabled="!canDuplicateExistingPages"
+                class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white disabled:cursor-not-allowed disabled:opacity-50 dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900"
               >
-                <div class="flex items-center justify-between gap-2">
-                  <span class="font-semibold truncate">{{ template.name }}</span>
-                  <File class="w-4 h-4 text-muted-foreground" />
-                </div>
-                <div class="template-scale-wrapper border border-dashed border-border/60 rounded-md bg-background/80">
-                  <div class="template-scale-inner">
-                    <div class="template-scale-content space-y-4">
-                      <template v-if="template.docId === BLANK_TEMPLATE_ID">
-                        <div class="flex h-32 items-center justify-center text-[100px] mt-[100px] text-muted-foreground">
-                          Blank page
-                        </div>
-                      </template>
-                      <template v-else-if="templateHasPreview(template)">
-                        <div
-                          v-for="(row, rowIndex) in templatePreviewRows(template)"
-                          :key="`${template.docId}-row-${row.id || rowIndex}`"
-                          class="w-full"
-                        >
-                          <div :class="previewGridClass(row)">
+                Existing
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="templates" class="mt-4 flex min-h-0 flex-1 flex-col">
+              <div class="w-full space-y-4">
+                <edge-shad-select
+                  v-model="state.templateFilter"
+                  label="Template Tags"
+                  :items="templateFilterOptions"
+                  item-title="label"
+                  item-value="value"
+                  placeholder="Select tag"
+                />
+                <p class="text-xs text-muted-foreground">
+                  Filter templates by tag or choose Quick Picks for the most commonly used layouts.
+                </p>
+              </div>
+              <edge-button-divider class="my-4">
+                <span class="text-xs text-muted-foreground !nowrap text-center">Select Template</span>
+              </edge-button-divider>
+              <div class="min-h-0 flex-1 overflow-y-auto pr-1">
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 auto-rows-fr pb-2">
+                  <button
+                    v-for="template in templateGridItems"
+                    :key="template.docId"
+                    type="button"
+                    class="rounded-lg border bg-card text-left p-3 flex flex-col gap-3 transition focus:outline-none focus-visible:ring-2"
+                    :class="isTemplateSelected(template.docId) ? 'border-primary ring-2 ring-primary/50 shadow-lg' : 'border-border hover:border-primary/40'"
+                    :aria-pressed="isTemplateSelected(template.docId)"
+                    @click="selectTemplate(template.docId)"
+                  >
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="font-semibold truncate">{{ template.name }}</span>
+                      <File class="w-4 h-4 text-muted-foreground" />
+                    </div>
+                    <div class="template-scale-wrapper border border-dashed border-border/60 rounded-md bg-background/80">
+                      <div class="template-scale-inner">
+                        <div class="template-scale-content space-y-4">
+                          <template v-if="template.docId === BLANK_TEMPLATE_ID">
+                            <div class="flex h-32 items-center justify-center text-[100px] mt-[100px] text-muted-foreground">
+                              Blank page
+                            </div>
+                          </template>
+                          <template v-else-if="templateHasPreview(template)">
                             <div
-                              v-for="(column, colIndex) in row.columns"
-                              :key="`${template.docId}-row-${row.id || rowIndex}-col-${column.id || colIndex}`"
-                              class="min-w-0"
-                              :style="previewColumnStyle(column)"
+                              v-for="(row, rowIndex) in templatePreviewRows(template)"
+                              :key="`${template.docId}-row-${row.id || rowIndex}`"
+                              class="w-full"
                             >
-                              <div
-                                v-for="(blockRef, blockIdx) in column.blocks || []"
-                                :key="`${template.docId}-row-${row.id || rowIndex}-col-${column.id || colIndex}-block-${blockIdx}`"
-                              >
-                                <edge-cms-block-api
-                                  v-if="resolveTemplateBlockForPreview(template, blockRef)"
-                                  :content="resolveTemplateBlockForPreview(template, blockRef).content"
-                                  :values="resolveTemplateBlockForPreview(template, blockRef).values"
-                                  :meta="resolveTemplateBlockForPreview(template, blockRef).meta"
-                                  :theme="theme"
-                                  :isolated="true"
-                                />
+                              <div :class="previewGridClass(row)">
+                                <div
+                                  v-for="(column, colIndex) in row.columns"
+                                  :key="`${template.docId}-row-${row.id || rowIndex}-col-${column.id || colIndex}`"
+                                  class="min-w-0"
+                                  :style="previewColumnStyle(column)"
+                                >
+                                  <div
+                                    v-for="(blockRef, blockIdx) in column.blocks || []"
+                                    :key="`${template.docId}-row-${row.id || rowIndex}-col-${column.id || colIndex}-block-${blockIdx}`"
+                                  >
+                                    <edge-cms-block-api
+                                      v-if="resolveTemplateBlockForPreview(template, blockRef)"
+                                      :content="resolveTemplateBlockForPreview(template, blockRef).content"
+                                      :values="resolveTemplateBlockForPreview(template, blockRef).values"
+                                      :meta="resolveTemplateBlockForPreview(template, blockRef).meta"
+                                      :theme="theme"
+                                      :isolated="true"
+                                    />
+                                  </div>
+                                </div>
                               </div>
                             </div>
-                          </div>
+                          </template>
+                          <template v-else>
+                            <div class="flex h-32 items-center justify-center text-[100px] mt-[100px] text-muted-foreground">
+                              No blocks yet
+                            </div>
+                          </template>
                         </div>
-                      </template>
-                      <template v-else>
-                        <div class="flex h-32 items-center justify-center text-[100px] mt-[100px]  text-muted-foreground">
-                          No blocks yet
-                        </div>
-                      </template>
+                      </div>
                     </div>
-                  </div>
+                  </button>
                 </div>
-              </button>
-            </div>
-          </div>
+              </div>
+            </TabsContent>
+
+            <TabsContent value="existing" class="mt-4 flex min-h-0 flex-1 flex-col">
+              <p class="text-xs text-muted-foreground">
+                Duplicate a page already created on this site and save it as a new page.
+              </p>
+              <edge-button-divider class="my-4">
+                <span class="text-xs text-muted-foreground !nowrap text-center">Duplicate Existing Page</span>
+              </edge-button-divider>
+              <div v-if="existingPagesList.length" class="min-h-0 flex-1 overflow-y-auto pr-1">
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 auto-rows-fr pb-2">
+                  <button
+                    v-for="existingPage in existingPagesList"
+                    :key="existingPage.docId"
+                    type="button"
+                    class="rounded-lg border bg-card text-left p-3 flex flex-col gap-3 transition focus:outline-none focus-visible:ring-2"
+                    :class="isExistingPageSelected(existingPage.docId) ? 'border-primary ring-2 ring-primary/50 shadow-lg' : 'border-border hover:border-primary/40'"
+                    :aria-pressed="isExistingPageSelected(existingPage.docId)"
+                    @click="selectExistingPage(existingPage.docId)"
+                  >
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="font-semibold truncate">{{ existingPage.name }}</span>
+                      <File class="w-4 h-4 text-muted-foreground" />
+                    </div>
+                    <div class="template-scale-wrapper border border-dashed border-border/60 rounded-md bg-background/80">
+                      <div class="template-scale-inner">
+                        <div class="template-scale-content space-y-4">
+                          <template v-if="templateHasPreview(existingPage)">
+                            <div
+                              v-for="(row, rowIndex) in templatePreviewRows(existingPage)"
+                              :key="`${existingPage.docId}-row-${row.id || rowIndex}`"
+                              class="w-full"
+                            >
+                              <div :class="previewGridClass(row)">
+                                <div
+                                  v-for="(column, colIndex) in row.columns"
+                                  :key="`${existingPage.docId}-row-${row.id || rowIndex}-col-${column.id || colIndex}`"
+                                  class="min-w-0"
+                                  :style="previewColumnStyle(column)"
+                                >
+                                  <div
+                                    v-for="(blockRef, blockIdx) in column.blocks || []"
+                                    :key="`${existingPage.docId}-row-${row.id || rowIndex}-col-${column.id || colIndex}-block-${blockIdx}`"
+                                  >
+                                    <edge-cms-block-api
+                                      v-if="resolveTemplateBlockForPreview(existingPage, blockRef)"
+                                      :content="resolveTemplateBlockForPreview(existingPage, blockRef).content"
+                                      :values="resolveTemplateBlockForPreview(existingPage, blockRef).values"
+                                      :meta="resolveTemplateBlockForPreview(existingPage, blockRef).meta"
+                                      :theme="theme"
+                                      :isolated="true"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          </template>
+                          <template v-else>
+                            <div class="flex h-32 items-center justify-center text-[100px] mt-[100px] text-muted-foreground">
+                              No blocks yet
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+                </div>
+              </div>
+              <div v-else class="flex flex-1 items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50/70 p-8 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
+                No existing pages available on this site yet.
+              </div>
+            </TabsContent>
+          </Tabs>
         </div>
         <DialogFooter class="pt-4">
           <edge-shad-button type="button" variant="destructive" @click="state.addPageDialog = false">
@@ -1433,6 +1755,7 @@ const theme = computed(() => {
               placeholder="Add tags"
               :items="templateTagItems"
               :allow-additions="true"
+              @add="addTemplateTagOption"
             />
             <edge-shad-select-tags
               v-if="props.isTemplateSite && props.themeOptions.length"
@@ -1555,6 +1878,11 @@ const theme = computed(() => {
   position: relative;
   border-radius: 0.5rem;
   height: 400px;
+}
+
+.template-scale-wrapper :deep(*) {
+  pointer-events: none !important;
+  user-select: none;
 }
 
 .template-scale-inner {

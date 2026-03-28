@@ -10,6 +10,7 @@ const props = defineProps({
   modelValue: {
     type: Array,
     required: false,
+    default: () => [],
   },
   class: {
     type: null,
@@ -73,6 +74,10 @@ const modelValue = useVModel(props, 'modelValue', emits, {
   passive: false,
   prop: 'modelValue',
 })
+const selectedValues = computed({
+  get: () => (Array.isArray(modelValue.value) ? modelValue.value : []),
+  set: value => (modelValue.value = Array.isArray(value) ? value : []),
+})
 const open = ref(false)
 const searchTerm = ref('')
 
@@ -84,7 +89,7 @@ const forceOpen = () => {
 }
 
 const filteredItems = computed(() => {
-  const options = computedItems.value.filter(i => !modelValue.value.includes(i[props.itemValue]))
+  const options = computedItems.value.filter(i => !selectedValues.value.includes(i[props.itemValue]))
   return searchTerm.value ? options.filter(option => contains(option[props.itemTitle], searchTerm.value)) : options
 })
 
@@ -111,8 +116,8 @@ const addValueToModel = (value) => {
   const normalized = normalize(value)
   if (!normalized)
     return
-  if (!modelValue.value.includes(normalized))
-    modelValue.value = [...modelValue.value, normalized]
+  if (!selectedValues.value.includes(normalized))
+    selectedValues.value = [...selectedValues.value, normalized]
 }
 
 const addFromSearch = () => {
@@ -165,18 +170,18 @@ const onSelectItem = (ev) => {
         </FormLabel>
         <div class="relative w-full items-center">
           <FormControl>
-            <Combobox v-model="modelValue" v-model:open="open" :ignore-filter="true" :disabled="props.disabled">
+            <Combobox v-model="selectedValues" v-model:open="open" :ignore-filter="true" :disabled="props.disabled">
               <ComboboxAnchor as-child>
                 <TagsInput
-                  v-model="modelValue"
-                  :class="cn('relative flex items-center gap-1 flex-nowrap pl-2 pr-1 pt-[7px] pb-[7px] w-80', props.class)"
+                  v-model="selectedValues"
+                  :class="cn('relative flex w-80 max-w-full min-w-0 items-center gap-1 overflow-hidden pl-2 pr-1 pt-[7px] pb-[7px] rounded-md border border-slate-300 bg-white text-slate-900 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100', props.class)"
                   :disabled="props.disabled"
                   @click="forceOpen"
                 >
                   <!-- Wrapping area for tags + input -->
-                  <div class="flex flex-wrap items-center gap-2 flex-1 min-w-0">
-                    <TagsInputItem v-for="val in modelValue" :key="val" class="h-6" :value="val">
-                      <span class="px-1">{{ valueToTitle[val] ?? val }}</span>
+                  <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2 overflow-hidden">
+                    <TagsInputItem v-for="val in selectedValues" :key="val" class="h-6 max-w-full min-w-0 border border-slate-300 bg-slate-100 text-slate-800 dark:border-slate-500 dark:bg-slate-700 dark:text-slate-100" :value="val">
+                      <span class="block max-w-[12rem] truncate px-1" :title="valueToTitle[val] ?? val">{{ valueToTitle[val] ?? val }}</span>
                       <TagsInputItemDelete v-if="!props.disabled" />
                     </TagsInputItem>
 
@@ -184,7 +189,7 @@ const onSelectItem = (ev) => {
                       <TagsInputInput
                         :disabled="props.disabled"
                         :placeholder="props.placeholder"
-                        class="p-0 border-none shadow-none focus-visible:ring-0 h-auto grow min-w-[6rem] w-auto"
+                        class="h-auto min-w-[5rem] max-w-full grow border-none p-0 shadow-none focus-visible:ring-0"
                         @input="forceOpen"
                         @keydown.enter.prevent="onEnter"
                       />
@@ -204,15 +209,15 @@ const onSelectItem = (ev) => {
                     <button
                       v-if="props.allowAdditions && searchTerm && searchTerm.trim() && !computedItems.some(item => String(item[props.itemValue]).toLowerCase() === searchTerm.trim().toLowerCase())"
                       type="button"
-                      class="w-full rounded-sm px-2 py-1 text-left text-sm hover:bg-muted"
+                      class="w-full rounded-sm px-2 py-1 text-left text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
                       @click.prevent="addFromSearch()"
                     >
                       Create "{{ searchTerm.trim() }}"
                     </button>
-                    <span v-else-if="searchTerm && searchTerm.trim()" class="block px-2 py-1 text-sm text-muted-foreground">
+                    <span v-else-if="searchTerm && searchTerm.trim()" class="block px-2 py-1 text-sm text-slate-500 dark:text-slate-400">
                       No results found
                     </span>
-                    <span v-else class="block px-2 py-1 text-sm text-muted-foreground">
+                    <span v-else class="block px-2 py-1 text-sm text-slate-500 dark:text-slate-400">
                       Start typing to search
                     </span>
                   </ComboboxEmpty>
@@ -267,7 +272,7 @@ const onSelectItem = (ev) => {
           <slot name="icon" />
         </span>
       </div>
-      <p class="text-sm text-muted-foreground mt-1">
+      <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">
         {{ props.description }}
       </p>
     </div>

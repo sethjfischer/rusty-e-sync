@@ -1,6 +1,7 @@
 <script setup>
 import { useVModel } from '@vueuse/core'
-import { ImagePlus, Loader2, Plus, Sparkles } from 'lucide-vue-next'
+import { renderTemplate } from '@edgedev/template-engine'
+import { ImagePlus, Loader2, Maximize2, Monitor, Plus, Smartphone, Sparkles, Tablet, X } from 'lucide-vue-next'
 const props = defineProps({
   modelValue: {
     type: Object,
@@ -22,9 +23,21 @@ const props = defineProps({
     type: String,
     default: '',
   },
+  routeLastSegment: {
+    type: String,
+    default: '',
+  },
   viewportMode: {
     type: String,
     default: 'auto',
+  },
+  renderContext: {
+    type: Object,
+    default: null,
+  },
+  standalonePreview: {
+    type: Boolean,
+    default: false,
   },
   allowDelete: {
     type: Boolean,
@@ -45,6 +58,14 @@ const props = defineProps({
   allowPreviewContentEdit: {
     type: Boolean,
     default: false,
+  },
+  suppressInteractiveClicksExceptAllowed: {
+    type: Boolean,
+    default: false,
+  },
+  interactivePreviewAllowSelector: {
+    type: String,
+    default: '',
   },
 })
 const emit = defineEmits(['update:modelValue', 'delete'])
@@ -106,6 +127,26 @@ function findMatchingBrace(str, startIdx) {
   return -1
 }
 
+const BLOCK_EDITOR_IGNORED_TAG_TYPES = new Set(['renderblocks'])
+const shouldIgnoreTagType = (type) => {
+  if (!type)
+    return false
+  return BLOCK_EDITOR_IGNORED_TAG_TYPES.has(String(type).toLowerCase())
+}
+const shouldIgnoreMeta = (meta) => {
+  if (!meta)
+    return false
+  return shouldIgnoreTagType(meta.type)
+}
+const removeIgnoredMetaEntries = (obj) => {
+  if (!obj)
+    return
+  for (const key of Object.keys(obj)) {
+    if (shouldIgnoreMeta(obj[key]))
+      delete obj[key]
+  }
+}
+
 function extractFieldsInOrder(template) {
   if (!template || typeof template !== 'string')
     return []
@@ -121,6 +162,9 @@ function extractFieldsInOrder(template) {
     if (!m)
       break
 
+    const type = m[1]
+    if (shouldIgnoreTagType(type))
+      continue
     const configStart = TAG_START_RE.lastIndex - 1
     if (configStart < 0 || template[configStart] !== '{')
       continue
@@ -156,14 +200,21 @@ function extractFieldsInOrder(template) {
 const modelValue = useVModel(props, 'modelValue', emit)
 const blockFormRef = ref(null)
 const previewContentEditorRef = ref(null)
+const fieldEditorPreviewRef = ref(null)
+const activePreviewField = ref('')
+const fieldEditorPreviewLoadedTick = ref(0)
 
 const state = reactive({
   open: false,
   editorMode: 'fields',
+  previewViewport: 'full',
+  previewScale: '100',
   draft: {},
   delete: false,
   meta: {},
   arrayItems: {},
+  arrayAddPopoverOpenByField: {},
+  arrayAddPopoverAllowCloseByField: {},
   reload: false,
   metaUpdate: {},
   loading: true,
@@ -195,10 +246,23 @@ const INTERACTIVE_CLICK_SELECTOR = [
   '[data-cms-nav-folder-toggle]',
   '[data-cms-nav-folder-menu]',
 ].join(', ')
+const DEFAULT_INTERACTIVE_PREVIEW_ALLOW_SELECTOR = [
+  '.cms-nav-toggle',
+  '.cms-nav-close',
+  '.cms-nav-overlay',
+  '[data-cms-nav-toggle]',
+  '[data-cms-nav-close]',
+  '[data-cms-nav-overlay]',
+].join(', ')
 const EDITOR_CONTROL_CLICK_SELECTOR = [
   '[data-cms-block-control]',
   '[data-cms-block-ignore-editor-click]',
 ].join(', ')
+
+const shouldAllowSuppressedInteractiveClick = (target) => {
+  const selector = String(props.interactivePreviewAllowSelector || '').trim() || DEFAULT_INTERACTIVE_PREVIEW_ALLOW_SELECTOR
+  return Boolean(selector && target?.closest?.(selector))
+}
 
 const hasFixedPositionInContent = computed(() => {
   const content = String(modelValue.value?.content || '')
@@ -207,6 +271,38 @@ const hasFixedPositionInContent = computed(() => {
 
 const normalizePreviewType = (value) => {
   return value === 'dark' ? 'dark' : 'light'
+}
+
+const normalizeBlockTypes = (value, { fallbackToPage = true } = {}) => {
+  const hasExplicitTypeValue = !(
+    value === undefined
+    || value === null
+    || value === ''
+    || (Array.isArray(value) && value.length === 0)
+  )
+  const rawTypes = Array.isArray(value) ? value : [value]
+  const normalized = rawTypes
+    .map((typeValue) => {
+      if (typeValue && typeof typeValue === 'object') {
+        const objectValue = typeValue.name ?? typeValue.value ?? typeValue.title ?? typeValue.label ?? ''
+        return String(objectValue || '')
+      }
+      return String(typeValue || '')
+    })
+    .map(typeValue => typeValue.trim().toLowerCase())
+    .map((typeValue) => {
+      if (typeValue === 'page')
+        return 'Page'
+      if (typeValue === 'post')
+        return 'Post'
+      return ''
+    })
+    .filter(Boolean)
+
+  const uniqueNormalized = [...new Set(normalized)]
+  if (!uniqueNormalized.length && fallbackToPage && !hasExplicitTypeValue)
+    return ['Page']
+  return uniqueNormalized
 }
 
 const resolvedPreviewType = computed(() => normalizePreviewType(modelValue.value?.previewType))
@@ -270,16 +366,76 @@ const isLightName = (value) => {
 }
 
 const previewBackgroundClass = value => (isLightName(value) ? 'bg-neutral-900/90' : 'bg-neutral-100')
+const previewViewportOptions = [
+  { id: 'full', label: 'Wild Width', width: '100%', icon: Maximize2 },
+  { id: 'large', label: 'Large Screen', width: '1280px', icon: Monitor },
+  { id: 'medium', label: 'Medium', width: '992px', icon: Tablet },
+  { id: 'mobile', label: 'Mobile', width: '420px', icon: Smartphone },
+]
+const previewScaleOptions = [
+  { name: '100', title: '100%' },
+  { name: '75', title: '75%' },
+  { name: '50', title: '50%' },
+  { name: '25', title: '25%' },
+]
+const selectedPreviewViewport = computed(() => previewViewportOptions.find(option => option.id === state.previewViewport) || previewViewportOptions[0])
+const previewScaleValue = computed(() => {
+  const parsed = Number.parseInt(String(state.previewScale || '100'), 10)
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return 100
+  return parsed
+})
+const previewScaleMultiplier = computed(() => previewScaleValue.value / 100)
+const previewViewportStyle = computed(() => {
+  const selected = selectedPreviewViewport.value
+  if (!selected || selected.id === 'full')
+    return { maxWidth: '100%' }
+  return {
+    width: '100%',
+    maxWidth: selected.width,
+    marginLeft: 'auto',
+    marginRight: 'auto',
+  }
+})
+const previewViewportContainStyle = computed(() => {
+  return {
+    ...(previewViewportStyle.value || {}),
+    zoom: previewScaleMultiplier.value,
+  }
+})
+const previewViewportMode = computed(() => {
+  if (state.previewViewport === 'full')
+    return 'auto'
+  return state.previewViewport
+})
+const setPreviewViewport = (viewportId) => {
+  state.previewViewport = viewportId
+}
+const arrayImageDialogKey = (entryField, index, schemaField) => `${entryField}::${index}::${schemaField}`
+const normalizeSelectedImageUrl = (url) => {
+  if (typeof url === 'string')
+    return url
+  if (url && typeof url === 'object') {
+    if (typeof url.url === 'string')
+      return url.url
+    const publicUrl = edgeGlobal.getImage(url, 'public')
+    if (typeof publicUrl === 'string')
+      return publicUrl
+  }
+  return ''
+}
+const setArrayImageValue = (entryField, index, schemaField, url) => {
+  const list = state.draft?.[entryField]
+  if (!Array.isArray(list) || !list[index] || typeof list[index] !== 'object')
+    return
+  list[index][schemaField] = normalizeSelectedImageUrl(url)
+  state.imageOpenByField[arrayImageDialogKey(entryField, index, schemaField)] = false
+}
 
 const PLACEHOLDERS = {
   text: 'Lorem ipsum dolor sit amet.',
   textarea: 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.',
   richtext: '<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>',
-  arrayItem: [
-    'Lorem ipsum dolor sit amet.',
-    'Consectetur adipiscing elit.',
-    'Sed do eiusmod tempor incididunt.',
-  ],
   image: 'https://imagedelivery.net/h7EjKG0X9kOxmLp41mxOng/f1f7f610-dfa9-4011-08a3-7a98d95e7500/thumbnail',
 }
 
@@ -322,6 +478,21 @@ const BLOCK_CONTENT_SNIPPETS = [
   {{child}}
 {{{/subarray}}}`,
     description: 'Nested array inside an array item',
+  },
+  {
+    label: 'Render Blocks',
+    snippet: '{{{#renderBlocks {"field":"item"}}}}',
+    description: 'Render block content from an object field',
+  },
+  {
+    label: 'Post Content Example',
+    snippet: `{{{#array {"field":"list","schema":[{"field":"name","value":"text"},{"field":"content","value":"richtext"}],"collection":{"path":"posts","uniqueKey":"{orgId}:{siteId}","query":[],"order":[]},"queryOptions":[],"limit":3,"value":[]}}}}
+  <article>
+    <h2>{{item.name}}</h2>
+    {{{#renderBlocks {"field":"item"}}}}
+  </article>
+{{{/array}}}`,
+    description: 'Example loop for posts with rendered post blocks',
   },
   {
     label: 'If / Else',
@@ -437,6 +608,9 @@ function* iterateTags(html) {
       break
 
     const type = m[1]
+    const tagStart = m.index
+    if (BLOCK_EDITOR_IGNORED_TAG_TYPES.has(type.toLowerCase()))
+      continue
     const configStart = TAG_START_RE.lastIndex - 1
     if (configStart < 0 || html[configStart] !== '{')
       continue
@@ -449,7 +623,7 @@ function* iterateTags(html) {
     const closeTriple = html.indexOf('}}}', configEnd)
     const tagEnd = closeTriple !== -1 ? closeTriple + 3 : configEnd + 1
 
-    yield { type, rawCfg, tagEnd }
+    yield { type, rawCfg, tagStart, tagEnd }
 
     TAG_START_RE.lastIndex = tagEnd
   }
@@ -477,18 +651,8 @@ const parseBlockContentModel = (html) => {
     else if (type === 'text')
       val = !val ? PLACEHOLDERS.text : String(val)
     else if (type === 'array') {
-      if (meta[field]?.limit > 0) {
-        val = Array(meta[field].limit).fill('placeholder')
-      }
-      else {
-        if (Array.isArray(val)) {
-          if (val.length === 0)
-            val = PLACEHOLDERS.arrayItem
-        }
-        else {
-          val = PLACEHOLDERS.arrayItem
-        }
-      }
+      // Keep array fields empty by default instead of injecting placeholder content.
+      val = Array.isArray(val) ? JSON.parse(JSON.stringify(val)) : []
     }
     else if (type === 'textarea')
       val = !val ? PLACEHOLDERS.textarea : String(val)
@@ -537,6 +701,36 @@ const blockContentSourceDoc = computed(() => {
   return edgeFirebase.data?.[`${edgeGlobal.edgeState.organizationDocPath}/blocks`]?.[blockDocId] || null
 })
 
+const sitePostsCollectionPath = computed(() => {
+  const siteId = String(props.siteId || '').trim()
+  if (!siteId)
+    return ''
+  return `${edgeGlobal.edgeState.organizationDocPath}/sites/${siteId}/posts`
+})
+
+const sitePublishedPostsCollectionPath = computed(() => {
+  const siteId = String(props.siteId || '').trim()
+  if (!siteId)
+    return ''
+  return `${edgeGlobal.edgeState.organizationDocPath}/sites/${siteId}/published_posts`
+})
+
+const ensureSitePostSnapshots = async () => {
+  const postsPath = sitePostsCollectionPath.value
+  const publishedPostsPath = sitePublishedPostsCollectionPath.value
+  if (!postsPath || !publishedPostsPath)
+    return
+
+  if (!edgeFirebase.data?.[postsPath])
+    await edgeFirebase.startSnapshot(postsPath)
+  if (!edgeFirebase.data?.[publishedPostsPath])
+    await edgeFirebase.startSnapshot(publishedPostsPath)
+}
+
+watch(() => [edgeGlobal.edgeState.currentOrganization, props.siteId], async () => {
+  await ensureSitePostSnapshots()
+}, { immediate: true })
+
 const blockContentPreviewBlock = computed(() => {
   const content = String(state.blockContentDraft ?? '')
   const sourceDoc = modelValue.value || blockContentSourceDoc.value || {}
@@ -565,6 +759,355 @@ const previewContentCanvasClass = computed(() => {
   const content = String(blockContentPreviewBlock.value?.content || '')
   const hasFixedContent = /\bfixed\b/.test(content)
   return hasFixedContent ? 'min-h-[calc(100vh-380px)]' : 'min-h-[220px]'
+})
+
+const fieldEditorPreviewBlock = computed(() => {
+  return {
+    ...JSON.parse(JSON.stringify(modelValue.value || {})),
+    previewType: effectivePreviewType.value,
+    values: JSON.parse(JSON.stringify(state.draft || {})),
+    meta: sanitizeQueryItems(state.meta),
+  }
+})
+
+const fieldEditorRenderValues = computed(() => {
+  const baseValues = fieldEditorPreviewBlock.value?.values || {}
+  if (!props.renderContext || typeof props.renderContext !== 'object' || Array.isArray(props.renderContext))
+    return baseValues
+
+  return {
+    ...props.renderContext,
+    renderBlocks: props.renderContext,
+    renderItem: props.renderContext,
+    ...baseValues,
+  }
+})
+
+const fieldEditorPreviewSurfaceClass = computed(() => {
+  return effectivePreviewType.value === 'light'
+    ? 'bg-white text-black'
+    : 'bg-neutral-950 text-neutral-50'
+})
+
+const fieldEditorPreviewCanvasClass = computed(() => {
+  return hasFixedPositionInContent.value ? 'min-h-[calc(100vh-260px)]' : 'min-h-[220px]'
+})
+
+const clearActivePreviewHighlights = () => {
+  const root = fieldEditorPreviewRef.value
+  if (!root || typeof document === 'undefined')
+    return
+
+  root.querySelectorAll('[data-cms-preview-highlight="text"]').forEach((el) => {
+    const parent = el.parentNode
+    if (!parent)
+      return
+    while (el.firstChild)
+      parent.insertBefore(el.firstChild, el)
+    parent.removeChild(el)
+  })
+
+  root.querySelectorAll('[data-cms-preview-highlight="element"]').forEach((el) => {
+    el.removeAttribute('data-cms-preview-highlight')
+  })
+}
+
+const normalizeHighlightText = (value) => {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const collectFieldRenderedOutputs = (field) => {
+  const outputs = []
+  const content = String(fieldEditorPreviewBlock.value?.content || '')
+  const meta = fieldEditorPreviewBlock.value?.meta || {}
+  const values = fieldEditorRenderValues.value || {}
+
+  for (const { rawCfg, tagStart, tagEnd } of iterateTags(content)) {
+    const cfg = safeParseTagConfig(rawCfg)
+    if (!cfg?.field || String(cfg.field).trim() !== field)
+      continue
+
+    const snippet = content.slice(tagStart, tagEnd)
+    try {
+      const rendered = renderTemplate(snippet, values, meta)
+      if (typeof rendered === 'string' && rendered.trim())
+        outputs.push(rendered)
+    }
+    catch {}
+  }
+
+  return Array.from(new Set(outputs))
+}
+
+const collectFieldValueTargets = (field, fieldMeta) => {
+  const textTargets = new Set()
+  const mediaTargets = new Set()
+  const rawValue = state.draft?.[field]
+
+  if (fieldMeta?.type === 'image') {
+    const mediaValue = String(rawValue || '').trim()
+    if (mediaValue)
+      mediaTargets.add(mediaValue)
+    return { textTargets, mediaTargets }
+  }
+
+  if (fieldMeta?.type === 'richtext') {
+    const container = document.createElement('div')
+    container.innerHTML = String(rawValue || '')
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+    let node = walker.nextNode()
+    while (node) {
+      const value = normalizeHighlightText(node.textContent)
+      if (value.length >= 2)
+        textTargets.add(value)
+      node = walker.nextNode()
+    }
+    container.querySelectorAll('[src],[srcset],[style]').forEach((el) => {
+      const src = String(el.getAttribute('src') || '').trim()
+      const srcset = String(el.getAttribute('srcset') || '').trim()
+      const style = String(el.getAttribute('style') || '').trim()
+      if (src)
+        mediaTargets.add(src)
+      if (srcset)
+        mediaTargets.add(srcset)
+      if (style)
+        mediaTargets.add(style)
+    })
+    return { textTargets, mediaTargets }
+  }
+
+  const textValue = normalizeHighlightText(rawValue)
+  if (textValue.length >= 2)
+    textTargets.add(textValue)
+  return { textTargets, mediaTargets }
+}
+
+const buildHighlightTargets = (field, outputs, fieldMeta) => {
+  const textTargets = new Set()
+  const mediaTargets = new Set()
+  const directTargets = collectFieldValueTargets(field, fieldMeta)
+
+  directTargets.textTargets.forEach(target => textTargets.add(target))
+  directTargets.mediaTargets.forEach(target => mediaTargets.add(target))
+
+  outputs.forEach((output) => {
+    const html = String(output || '')
+    if (!html.trim())
+      return
+
+    if (fieldMeta?.type === 'image') {
+      mediaTargets.add(html.trim())
+      return
+    }
+
+    const container = document.createElement('div')
+    container.innerHTML = html
+
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+    let node = walker.nextNode()
+    while (node) {
+      const value = normalizeHighlightText(node.textContent)
+      if (value.length >= 2)
+        textTargets.add(value)
+      node = walker.nextNode()
+    }
+
+    container.querySelectorAll('[src],[srcset],[style]').forEach((el) => {
+      const src = String(el.getAttribute('src') || '').trim()
+      const srcset = String(el.getAttribute('srcset') || '').trim()
+      const style = String(el.getAttribute('style') || '').trim()
+      if (src)
+        mediaTargets.add(src)
+      if (srcset)
+        mediaTargets.add(srcset)
+      if (style)
+        mediaTargets.add(style)
+    })
+  })
+
+  return {
+    textTargets: Array.from(textTargets).sort((a, b) => b.length - a.length),
+    mediaTargets: Array.from(mediaTargets),
+  }
+}
+
+const wrapTextMatchesInPreview = (root, target) => {
+  if (!target || target.trim().length < 3)
+    return 0
+
+  const textNodes = []
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node?.textContent?.trim())
+        return NodeFilter.FILTER_REJECT
+      if (node.parentElement?.closest?.('[data-cms-preview-highlight="text"]'))
+        return NodeFilter.FILTER_REJECT
+      if (node.parentElement?.closest?.('script,style,noscript'))
+        return NodeFilter.FILTER_REJECT
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+
+  let current = walker.nextNode()
+  while (current) {
+    textNodes.push(current)
+    current = walker.nextNode()
+  }
+
+  let matches = 0
+  textNodes.forEach((textNode) => {
+    let node = textNode
+    while (node?.nodeType === Node.TEXT_NODE) {
+      const value = String(node.textContent || '')
+      const index = value.indexOf(target)
+      if (index === -1)
+        break
+
+      if (index > 0)
+        node = node.splitText(index)
+
+      const tail = node.splitText(target.length)
+      const mark = document.createElement('span')
+      mark.setAttribute('data-cms-preview-highlight', 'text')
+      node.parentNode?.insertBefore(mark, node)
+      mark.appendChild(node)
+      matches++
+      node = tail
+    }
+  })
+
+  return matches
+}
+
+const highlightElementTextMatches = (root, targets) => {
+  let matches = 0
+  if (!targets.length)
+    return matches
+
+  const elements = Array.from(root.querySelectorAll('*')).filter((el) => {
+    if (el.closest('script,style,noscript'))
+      return false
+    const text = normalizeHighlightText(el.textContent)
+    return text.length >= 2
+  })
+
+  targets.forEach((target) => {
+    const normalizedTarget = normalizeHighlightText(target)
+    if (!normalizedTarget)
+      return
+
+    const candidates = elements.filter((el) => {
+      const text = normalizeHighlightText(el.textContent)
+      if (!text.includes(normalizedTarget))
+        return false
+      return !Array.from(el.children || []).some((child) => {
+        return normalizeHighlightText(child.textContent).includes(normalizedTarget)
+      })
+    })
+
+    candidates.forEach((el) => {
+      el.setAttribute('data-cms-preview-highlight', 'element')
+      matches++
+    })
+  })
+
+  return matches
+}
+
+const highlightPreviewMediaMatches = (root, targets) => {
+  let matches = 0
+  if (!targets.length)
+    return matches
+
+  root.querySelectorAll('img, source, video, iframe, [style]').forEach((el) => {
+    const src = String(el.getAttribute('src') || '').trim()
+    const srcset = String(el.getAttribute('srcset') || '').trim()
+    const style = String(el.getAttribute('style') || '').trim()
+    if (targets.some(target => target && (src === target || srcset.includes(target) || style.includes(target)))) {
+      el.setAttribute('data-cms-preview-highlight', 'element')
+      matches++
+    }
+  })
+
+  return matches
+}
+
+const syncActivePreviewHighlight = () => {
+  clearActivePreviewHighlights()
+
+  if (typeof document === 'undefined')
+    return
+
+  const field = String(activePreviewField.value || '').trim()
+  if (!field)
+    return
+
+  const root = fieldEditorPreviewRef.value
+  if (!root)
+    return
+
+  const fieldMeta = fieldEditorPreviewBlock.value?.meta?.[field]
+  if (!fieldMeta || fieldMeta.type === 'array')
+    return
+
+  const outputs = collectFieldRenderedOutputs(field)
+  if (!outputs.length && !state.draft?.[field])
+    return
+
+  const { textTargets, mediaTargets } = buildHighlightTargets(field, outputs, fieldMeta)
+  let matchCount = 0
+
+  textTargets.forEach((target) => {
+    matchCount += wrapTextMatchesInPreview(root, target)
+  })
+
+  if (matchCount === 0)
+    matchCount += highlightElementTextMatches(root, textTargets)
+
+  matchCount += highlightPreviewMediaMatches(root, mediaTargets)
+
+  if (matchCount > 0)
+    return
+
+  if (fieldMeta.type === 'image') {
+    const directValue = String(state.draft?.[field] || '').trim()
+    if (directValue)
+      highlightPreviewMediaMatches(root, [directValue])
+  }
+}
+
+const setActivePreviewField = (field) => {
+  activePreviewField.value = String(field || '').trim()
+}
+
+const handleFieldEditorPreviewLoaded = () => {
+  fieldEditorPreviewLoadedTick.value++
+}
+
+watch(
+  () => [activePreviewField.value, fieldEditorPreviewLoadedTick.value, state.open, state.editorMode, props.editMode, state.draft],
+  async () => {
+    await nextTick()
+    if (!props.editMode || !state.open || state.editorMode !== 'fields') {
+      clearActivePreviewHighlights()
+      return
+    }
+    syncActivePreviewHighlight()
+  },
+  { deep: true },
+)
+
+watch(() => state.open, (open) => {
+  if (!open) {
+    activePreviewField.value = ''
+    clearActivePreviewHighlights()
+  }
+})
+
+onBeforeUnmount(() => {
+  clearActivePreviewHighlights()
 })
 
 const openPreviewContentEditor = async () => {
@@ -608,6 +1151,8 @@ const updateBlockContent = async () => {
   // Preserve page/block-instance values when editing block content from preview mode.
   const { values: instanceValues, meta: instanceMeta } = buildUpdatedBlockDocFromContent(nextContent, modelValue.value || {})
   const blockUpdatedAt = new Date().toISOString()
+  const nextType = normalizeBlockTypes(blockData?.type)
+  const normalizedNextType = nextType.length ? nextType : ['Page']
 
   const previousModelValue = edgeGlobal.dupObject(modelValue.value || {})
   modelValue.value = {
@@ -627,6 +1172,7 @@ const updateBlockContent = async () => {
       values: blockValues,
       meta: blockMeta,
       blockUpdatedAt,
+      type: normalizedNextType,
     })
     if (results?.success === false) {
       throw new Error(results?.error || 'Failed to update block content.')
@@ -648,9 +1194,14 @@ const openEditor = async (event) => {
   if (!canOpenEditor.value)
     return
   const target = event?.target
+  const shouldSuppressClick = props.suppressInteractiveClicksExceptAllowed && !shouldAllowSuppressedInteractiveClick(target)
   if (target?.closest?.(EDITOR_CONTROL_CLICK_SELECTOR))
     return
   const shouldOverrideEditClicks = props.editMode && props.overrideClicksInEditMode
+  if (shouldSuppressClick) {
+    event?.preventDefault?.()
+    event?.stopPropagation?.()
+  }
   if (shouldOverrideEditClicks) {
     event?.preventDefault?.()
     event?.stopPropagation?.()
@@ -661,8 +1212,11 @@ const openEditor = async (event) => {
     await openPreviewContentEditor()
     return
   }
-  if (!shouldOverrideEditClicks && target?.closest?.(INTERACTIVE_CLICK_SELECTOR))
-    return
+  if (!shouldOverrideEditClicks && target?.closest?.(INTERACTIVE_CLICK_SELECTOR)) {
+    if (!shouldSuppressClick) {
+      return
+    }
+  }
   const blockData = edgeFirebase.data[`${edgeGlobal.edgeState.organizationDocPath}/blocks`]?.[modelValue.value.blockId]
   const templateMeta = blockData?.meta || modelValue.value?.meta || {}
   const storedMeta = modelValue.value?.meta || {}
@@ -691,7 +1245,9 @@ const openEditor = async (event) => {
   state.draft = JSON.parse(JSON.stringify(modelValue.value?.values || {}))
   state.meta = JSON.parse(JSON.stringify(mergedMeta || {}))
   ensureQueryItemsDefaults(state.meta)
+  removeIgnoredMetaEntries(state.meta)
   state.metaUpdate = edgeGlobal.dupObject(mergedMeta) || {}
+  removeIgnoredMetaEntries(state.metaUpdate)
   if (blockData?.values) {
     for (const key of Object.keys(blockData.values)) {
       if (!(key in state.draft)) {
@@ -704,6 +1260,25 @@ const openEditor = async (event) => {
   state.editorMode = 'fields'
   state.open = true
   state.afterLoad = true
+}
+
+const getAuthoredFieldMeta = (field) => {
+  const normalizedField = String(field || '').trim()
+  if (!normalizedField)
+    return null
+
+  const blockData = edgeFirebase.data[`${edgeGlobal.edgeState.organizationDocPath}/blocks`]?.[modelValue.value?.blockId]
+  const authoredContent = String(blockData?.content || modelValue.value?.content || '').trim()
+  if (!authoredContent)
+    return null
+
+  const parsed = parseBlockContentModel(authoredContent)
+  return parsed?.meta?.[normalizedField] || null
+}
+
+const hasAuthoredLimit = (field) => {
+  const authoredMeta = getAuthoredFieldMeta(field)
+  return !!authoredMeta && Object.prototype.hasOwnProperty.call(authoredMeta, 'limit')
 }
 
 const isLimitOne = (field) => {
@@ -768,14 +1343,14 @@ const orderedMeta = computed(() => {
   const picked = new Set()
 
   for (const f of orderedFields) {
-    if (f in metaObj) {
+    if (f in metaObj && !shouldIgnoreMeta(metaObj[f])) {
       out.push({ field: f, meta: metaObj[f] })
       picked.add(f)
     }
   }
 
   for (const f of Object.keys(metaObj)) {
-    if (!picked.has(f)) {
+    if (!picked.has(f) && !shouldIgnoreMeta(metaObj[f])) {
       out.push({ field: f, meta: metaObj[f] })
     }
   }
@@ -795,7 +1370,7 @@ const hasEditableArrayControls = (entry) => {
   const supportsQueryControls = collectionPath !== 'post'
   const queryOptions = Array.isArray(entry.meta?.queryOptions) ? entry.meta.queryOptions : []
   const hasQueryOptions = supportsQueryControls && queryOptions.length > 0
-  const hasLimitControl = supportsQueryControls && !isLimitOne(entry.field)
+  const hasLimitControl = supportsQueryControls && hasAuthoredLimit(entry.field) && !isLimitOne(entry.field)
 
   return hasQueryOptions || hasLimitControl
 }
@@ -976,10 +1551,28 @@ const generateWithAi = async () => {
     state.aiGenerating = false
   }
 }
+const setArrayAddPopoverOpen = (field, nextOpen) => {
+  if (nextOpen) {
+    state.arrayAddPopoverOpenByField[field] = true
+    return
+  }
+
+  if (state.arrayAddPopoverAllowCloseByField[field]) {
+    state.arrayAddPopoverOpenByField[field] = false
+    state.arrayAddPopoverAllowCloseByField[field] = false
+  }
+}
+
+const closeArrayAddPopover = (field) => {
+  state.arrayAddPopoverAllowCloseByField[field] = true
+  state.arrayAddPopoverOpenByField[field] = false
+}
+
 const addToArray = async (field) => {
   state.reload = true
   state.draft[field].push(JSON.parse(JSON.stringify(state.arrayItems[field])))
   resetArrayItems(field)
+  closeArrayAddPopover(field)
   await nextTick()
   state.reload = false
 }
@@ -997,7 +1590,7 @@ const loadingRender = (content) => {
 }
 
 const postsList = computed(() => {
-  const postsCollectionPath = `${edgeGlobal.edgeState.organizationDocPath}/sites/${props.siteId}/posts`
+  const postsCollectionPath = sitePostsCollectionPath.value
   return Object.values(edgeFirebase.data[postsCollectionPath] || {}).sort((a, b) => {
     if (a.publishDate && b.publishDate) {
       return new Date(b.publishDate).getTime() - new Date(a.publishDate).getTime()
@@ -1030,7 +1623,7 @@ const getTagsFromPosts = computed(() => {
     >
       <!-- Content -->
       <div :class="props.editMode && props.overrideClicksInEditMode ? 'pointer-events-none' : ''">
-        <edge-cms-block-api :site-id="props.siteId" :theme="props.theme" :content="modelValue?.content" :values="modelValue?.values" :meta="modelValue?.meta" :viewport-mode="props.viewportMode" @pending="state.loading = $event" />
+        <edge-cms-block-api :site-id="props.siteId" :route-last-segment="props.routeLastSegment" :theme="props.theme" :content="modelValue?.content" :values="modelValue?.values" :meta="modelValue?.meta" :viewport-mode="props.viewportMode" :render-context="props.renderContext" :standalone-preview="props.standalonePreview" @pending="state.loading = $event" />
         <edge-cms-block-render
           v-if="state.loading"
           :content="loadingRender(modelValue?.content)"
@@ -1038,6 +1631,8 @@ const getTagsFromPosts = computed(() => {
           :meta="modelValue?.meta"
           :theme="props.theme"
           :viewport-mode="props.viewportMode"
+          :render-context="props.renderContext"
+          :standalone-preview="props.standalonePreview"
         />
       </div>
       <!-- Darken overlay on hover -->
@@ -1048,6 +1643,12 @@ const getTagsFromPosts = computed(() => {
         v-if="props.editMode"
         class="pointer-events-none absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-200 z-[10001]"
       >
+        <div class="absolute top-2 left-2">
+          <span class="inline-flex items-center rounded bg-black px-2 py-1 text-[11px] font-medium leading-none text-white">
+            {{ previewBlockDisplayName }}
+          </span>
+        </div>
+
         <!-- Delete button top right -->
         <div v-if="props.allowDelete" data-cms-block-control class="pointer-events-auto absolute top-2 right-2">
           <edge-shad-button
@@ -1091,7 +1692,8 @@ const getTagsFromPosts = computed(() => {
       <edge-cms-block-sheet-content
         v-if="state.afterLoad"
         :side="state.editorMode === 'content' ? 'left' : 'right'"
-        :class="state.editorMode === 'content'
+        class="flex h-full min-h-0 flex-col overflow-hidden bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-50"
+        :class="state.editorMode === 'content' || props.editMode
           ? 'w-full max-w-none sm:max-w-none md:max-w-none'
           : 'w-full md:w-1/2 max-w-none sm:max-w-none max-w-2xl'"
       >
@@ -1147,19 +1749,45 @@ const getTagsFromPosts = computed(() => {
                 </edge-cms-code-editor>
               </div>
               <div class="min-h-0 rounded-md border border-border bg-card overflow-hidden flex flex-col">
-                <div class="px-3 py-2 border-b border-border text-xs font-semibold uppercase tracking-wide text-muted-foreground bg-muted/40">
-                  Live Preview
+                <div class="flex items-center justify-between gap-2 px-3 py-2 border-b border-border bg-muted/40">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Live Preview</span>
+                  <div class="flex shrink-0 items-center gap-1 flex-nowrap">
+                    <edge-shad-select
+                      v-model="state.previewScale"
+                      :items="previewScaleOptions"
+                      placeholder="%"
+                      class="w-[84px] shrink-0"
+                      trigger-class="!h-7 min-h-7 px-2 py-1 text-xs"
+                    />
+                    <edge-shad-button
+                      v-for="option in previewViewportOptions"
+                      :key="option.id"
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      class="h-7 w-7 shrink-0 text-xs border transition-colors"
+                      :class="state.previewViewport === option.id ? 'bg-slate-700 text-white border-slate-700 shadow-sm dark:bg-slate-200 dark:text-slate-900 dark:border-slate-200' : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-200 dark:border-slate-700 dark:hover:bg-slate-800'"
+                      @click="setPreviewViewport(option.id)"
+                    >
+                      <component :is="option.icon" class="w-3.5 h-3.5" />
+                    </edge-shad-button>
+                  </div>
                 </div>
                 <div class="flex-1 min-h-0 overflow-y-auto p-3">
-                  <div class="relative overflow-visible rounded-none" :class="[previewContentSurfaceClass, previewContentCanvasClass]" style="transform: translateZ(0);">
-                    <edge-cms-block-api
-                      :site-id="props.siteId"
-                      :theme="props.theme"
-                      :content="blockContentPreviewBlock.content"
-                      :values="blockContentPreviewBlock.values"
-                      :meta="blockContentPreviewBlock.meta"
-                      :viewport-mode="props.viewportMode"
-                    />
+                  <div class="w-full mx-auto rounded-none overflow-visible" :style="previewViewportContainStyle">
+                    <div class="relative overflow-visible rounded-none" :class="[previewContentSurfaceClass, previewContentCanvasClass]" style="transform: translateZ(0);">
+                      <edge-cms-block-api
+                        :site-id="props.siteId"
+                        :route-last-segment="props.routeLastSegment"
+                        :theme="props.theme"
+                        :content="blockContentPreviewBlock.content"
+                        :values="blockContentPreviewBlock.values"
+                        :meta="blockContentPreviewBlock.meta"
+                        :viewport-mode="previewViewportMode"
+                        :render-context="props.renderContext"
+                        :standalone-preview="true"
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1213,51 +1841,130 @@ const getTagsFromPosts = computed(() => {
             </div>
           </SheetHeader>
 
-          <edge-shad-form ref="blockFormRef">
-            <div v-if="editableMetaEntries.length === 0">
-              <Alert variant="info" class="mt-4 mb-4">
-                <AlertTitle>No editable fields found</AlertTitle>
-                <AlertDescription class="text-sm">
-                  This block does not have any editable fields defined.
-                </AlertDescription>
-              </Alert>
-            </div>
-            <div :class="modelValue.synced ? 'h-[calc(100vh-160px)]' : 'h-[calc(100vh-130px)]'" class="p-6 space-y-4   overflow-y-auto">
+          <edge-shad-form ref="blockFormRef" :class="props.editMode ? 'flex min-h-0 flex-1 flex-col' : ''">
+            <div :class="props.editMode ? 'grid min-h-0 flex-1 gap-4 overflow-hidden px-6 pb-4 pt-3 xl:grid-cols-[minmax(0,1fr)_minmax(320px,26vw)]' : ''">
+              <div v-if="props.editMode" class="min-h-0 rounded-md border border-border bg-card overflow-hidden flex flex-col">
+                <div class="flex items-center justify-between gap-2 px-3 py-2 border-b border-border bg-muted/40">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Live Preview</span>
+                  <div class="flex shrink-0 items-center gap-1 flex-nowrap">
+                    <edge-shad-select
+                      v-model="state.previewScale"
+                      :items="previewScaleOptions"
+                      placeholder="%"
+                      class="w-[84px] shrink-0"
+                      trigger-class="!h-7 min-h-7 px-2 py-1 text-xs"
+                    />
+                    <edge-shad-button
+                      v-for="option in previewViewportOptions"
+                      :key="option.id"
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      class="h-7 w-7 shrink-0 text-xs border transition-colors"
+                      :class="state.previewViewport === option.id ? 'bg-slate-700 text-white border-slate-700 shadow-sm dark:bg-slate-200 dark:text-slate-900 dark:border-slate-200' : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-200 dark:border-slate-700 dark:hover:bg-slate-800'"
+                      @click="setPreviewViewport(option.id)"
+                    >
+                      <component :is="option.icon" class="w-3.5 h-3.5" />
+                    </edge-shad-button>
+                  </div>
+                </div>
+                <div class="flex-1 min-h-0 overflow-y-auto p-3">
+                  <div class="w-full mx-auto rounded-none overflow-visible" :style="previewViewportContainStyle">
+                    <div ref="fieldEditorPreviewRef" class="relative overflow-visible rounded-none" :class="[fieldEditorPreviewSurfaceClass, fieldEditorPreviewCanvasClass]" style="transform: translateZ(0);">
+                      <edge-cms-block-api
+                        :site-id="props.siteId"
+                        :route-last-segment="props.routeLastSegment"
+                        :theme="props.theme"
+                        :content="fieldEditorPreviewBlock.content"
+                        :values="fieldEditorPreviewBlock.values"
+                        :meta="fieldEditorPreviewBlock.meta"
+                        :viewport-mode="previewViewportMode"
+                        :render-context="props.renderContext"
+                        :standalone-preview="true"
+                        @loaded="handleFieldEditorPreviewLoaded"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div :class="props.editMode ? 'min-h-0 flex flex-col overflow-hidden rounded-md border border-border bg-card' : ''">
+                <div v-if="editableMetaEntries.length === 0">
+                  <Alert variant="info" :class="props.editMode ? 'mb-4' : 'mt-4 mb-4'">
+                    <AlertTitle>No editable fields found</AlertTitle>
+                    <AlertDescription class="text-sm">
+                      This block does not have any editable fields defined.
+                    </AlertDescription>
+                  </Alert>
+                </div>
+                <div v-else-if="props.editMode" class="shrink-0 border-b border-border bg-muted/30 px-4 py-2 text-[11px] font-medium text-muted-foreground">
+                  Scroll this panel for more fields.
+                </div>
+                <div
+                  :class="props.editMode
+                    ? 'flex-1 min-h-0 overflow-y-auto p-4 space-y-4'
+                    : modelValue.synced
+                      ? 'h-[calc(100vh-160px)] p-6 space-y-4 overflow-y-auto'
+                      : 'h-[calc(100vh-130px)] p-6 space-y-4 overflow-y-auto'"
+                >
               <template v-for="entry in editableMetaEntries" :key="entry.field">
-                <div v-if="entry.meta.type === 'array'">
+                <div v-if="entry.meta.type === 'array'" @focusin="setActivePreviewField(entry.field)" @mousedown.capture="setActivePreviewField(entry.field)">
                   <div v-if="!entry.meta?.api && !entry.meta?.collection">
                     <div v-if="entry.meta?.schema">
                       <Card v-if="!state.reload" class="mb-4 bg-white shadow-sm border border-gray-200 p-4">
                         <CardHeader class="p-0 mb-2">
-                          <div class="relative flex items-center bg-secondary p-2 justify-between sticky top-0 z-10 bg-primary rounded">
+                          <div class="relative flex items-center p-2 justify-between sticky top-0 z-10 rounded border border-slate-300 bg-slate-200 text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
                             <span class="text-lg font-semibold whitespace-nowrap pr-1"> {{ genTitleFromField(entry) }}</span>
                             <div class="flex w-full items-center">
                               <div class="w-full border-t border-gray-300 dark:border-white/15" aria-hidden="true" />
-                              <edge-shad-button variant="text" class="hover:text-primary/50 text-xs h-[26px] text-primary" @click="state.editMode = !state.editMode">
-                                <Popover>
+                              <edge-shad-button variant="text" class="text-xs h-[26px] text-slate-700 hover:text-slate-900 dark:text-slate-200 dark:hover:text-white" @click="state.editMode = !state.editMode">
+                                <Popover
+                                  :open="!!state.arrayAddPopoverOpenByField[entry.field]"
+                                  @update:open="(open) => setArrayAddPopoverOpen(entry.field, open)"
+                                >
                                   <PopoverTrigger as-child>
                                     <edge-shad-button
                                       variant="text"
                                       type="submit"
-                                      class="bg-secondary hover:text-primary/50 text-xs h-[26px] text-primary"
+                                      class="bg-slate-300 text-slate-900 hover:bg-slate-400 text-xs h-[26px] dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600"
                                     >
                                       <Plus class="w-4 h-4" />
                                     </edge-shad-button>
                                   </PopoverTrigger>
-                                  <PopoverContent class="!w-80 mr-20">
-                                    <Card class="border-none shadow-none p-4">
+                                  <PopoverContent align="start" class="!w-[calc(100vw-3rem)] md:!w-[calc(50vw-3rem)] max-w-none bg-slate-200 border-slate-300">
+                                    <Card class="border-none shadow-none p-4 bg-transparent">
+                                      <div class="mb-2 flex justify-end">
+                                        <edge-shad-button
+                                          type="button"
+                                          variant="ghost"
+                                          size="icon"
+                                          class="h-7 w-7"
+                                          @click="closeArrayAddPopover(entry.field)"
+                                        >
+                                          <X class="h-4 w-4" />
+                                        </edge-shad-button>
+                                      </div>
                                       <template v-for="schemaItem in entry.meta.schema" :key="schemaItem.field">
                                         <edge-cms-block-input
                                           v-model="state.arrayItems[entry.field][schemaItem.field]"
                                           :type="schemaItem.type"
                                           :field="schemaItem.field"
                                           :schema="schemaItem"
+                                          :site="props.siteId"
                                           :label="genTitleFromField(schemaItem)"
                                         />
                                       </template>
-                                      <CardFooter class="mt-2 flex justify-end">
+                                      <CardFooter class="mt-2 flex justify-end gap-2">
                                         <edge-shad-button
-                                          class="bg-secondary hover:text-white text-xs h-[26px] text-primary"
+                                          type="button"
+                                          variant="outline"
+                                          class="text-xs h-[26px]"
+                                          @click="closeArrayAddPopover(entry.field)"
+                                        >
+                                          Cancel
+                                        </edge-shad-button>
+                                        <edge-shad-button
+                                          type="button"
+                                          class="bg-slate-700 text-white hover:bg-slate-800 text-xs h-[26px] dark:bg-slate-200 dark:text-slate-900 dark:hover:bg-slate-300"
                                           @click="addToArray(entry.field)"
                                         >
                                           Add Entry
@@ -1278,13 +1985,57 @@ const getTagsFromPosts = computed(() => {
                         >
                           <template #item="{ element, index }">
                             <div :key="index" class="">
-                              <div class="flex gap-2 w-full items-center w-full border-1 border-dotted py-1 mb-1">
-                                <div class="text-left px-2">
+                              <div class="flex w-full items-start gap-2 border-1 border-dotted py-1 mb-1">
+                                <div class="text-left px-2 shrink-0 pt-1">
                                   <Grip class="handle pointer" />
                                 </div>
-                                <div class="px-2 py-2 w-[98%] flex gap-1">
+                                <div class="px-2 py-2 flex-1 min-w-0 flex flex-wrap gap-1">
                                   <template v-for="schemaItem in entry.meta.schema" :key="schemaItem.field">
-                                    <Popover>
+                                    <Dialog v-if="schemaItem.type === 'image'" v-model:open="state.imageOpenByField[arrayImageDialogKey(entry.field, index, schemaItem.field)]">
+                                      <DialogTrigger as-child>
+                                        <Alert class="w-[200px] text-xs py-1 px-2 cursor-pointer hover:bg-primary hover:text-white">
+                                          <AlertTitle>{{ genTitleFromField(schemaItem) }}</AlertTitle>
+                                          <AlertDescription class="text-sm truncate max-w-[200px]">
+                                            <div class="w-full flex justify-center">
+                                              <div
+                                                v-if="element[schemaItem.field]"
+                                                class="inline-flex h-8 min-w-8 max-w-[72px] items-center justify-center rounded border border-border px-1"
+                                                :class="previewBackgroundClass(element[schemaItem.field])"
+                                              >
+                                                <img
+                                                  :src="element[schemaItem.field]"
+                                                  class="max-h-7 w-auto max-w-full object-contain"
+                                                >
+                                              </div>
+                                              <span v-else class="inline-flex items-center gap-1 justify-center">
+                                                <ImagePlus class="h-3.5 w-3.5" />
+                                                Select Image
+                                              </span>
+                                            </div>
+                                          </AlertDescription>
+                                        </Alert>
+                                      </DialogTrigger>
+                                      <DialogContent class="w-full max-w-[1200px] max-h-[80vh] overflow-y-auto">
+                                        <DialogHeader>
+                                          <DialogTitle>Select Image</DialogTitle>
+                                          <DialogDescription />
+                                        </DialogHeader>
+                                        <edge-cms-media-manager
+                                          v-if="schemaItem?.tags && schemaItem.tags.length > 0"
+                                          :site="props.siteId"
+                                          :select-mode="true"
+                                          :default-tags="schemaItem.tags"
+                                          @select="(url) => setArrayImageValue(entry.field, index, schemaItem.field, url)"
+                                        />
+                                        <edge-cms-media-manager
+                                          v-else
+                                          :site="props.siteId"
+                                          :select-mode="true"
+                                          @select="(url) => setArrayImageValue(entry.field, index, schemaItem.field, url)"
+                                        />
+                                      </DialogContent>
+                                    </Dialog>
+                                    <Popover v-else>
                                       <PopoverTrigger as-child>
                                         <Alert class="w-[200px] text-xs py-1 px-2 cursor-pointer hover:bg-primary hover:text-white">
                                           <AlertTitle> {{ genTitleFromField(schemaItem) }}</AlertTitle>
@@ -1293,13 +2044,14 @@ const getTagsFromPosts = computed(() => {
                                           </AlertDescription>
                                         </Alert>
                                       </PopoverTrigger>
-                                      <PopoverContent class="!w-80 mr-20">
+                                      <PopoverContent align="start" class="!w-[calc(100vw-3rem)] md:!w-[calc(50vw-3rem)] max-w-none">
                                         <Card class="border-none shadow-none p-4">
                                           <edge-cms-block-input
                                             v-model="element[schemaItem.field]"
                                             :type="schemaItem.type"
                                             :schema="schemaItem"
                                             :field="`${schemaItem.field}-${index}-entry`"
+                                            :site="props.siteId"
                                             :label="genTitleFromField(schemaItem)"
                                           />
                                         </Card>
@@ -1307,13 +2059,14 @@ const getTagsFromPosts = computed(() => {
                                     </Popover>
                                   </template>
                                 </div>
-                                <div class="pr-2">
+                                <div class="text-left px-2 shrink-0 pt-1">
                                   <edge-shad-button
                                     variant="destructive"
                                     size="icon"
+                                    class="h-6 w-6"
                                     @click="state.draft[entry.field].splice(index, 1)"
                                   >
-                                    <Trash class="h-4 w-4" />
+                                    <Trash class="h-3.5 w-3.5" />
                                   </edge-shad-button>
                                 </div>
                               </div>
@@ -1327,6 +2080,7 @@ const getTagsFromPosts = computed(() => {
                       v-model="state.draft[entry.field]"
                       :type="entry.meta.type"
                       :field="entry.field"
+                      :site="props.siteId"
                       :label="genTitleFromField(entry)"
                     />
                   </div>
@@ -1351,14 +2105,14 @@ const getTagsFromPosts = computed(() => {
                       </div>
                     </template>
                     <edge-shad-number
-                      v-if="entry.meta?.collection?.path !== 'post' && !isLimitOne(entry.field)"
+                      v-if="entry.meta?.collection?.path !== 'post' && hasAuthoredLimit(entry.field) && !isLimitOne(entry.field)"
                       v-model="state.meta[entry.field].limit"
                       name="limit"
                       label="Limit"
                     />
                   </div>
                 </div>
-                <div v-else-if="entry.meta?.type === 'image'" class="w-full">
+                <div v-else-if="entry.meta?.type === 'image'" class="w-full" @focusin="setActivePreviewField(entry.field)" @mousedown.capture="setActivePreviewField(entry.field)">
                   <div class="mb-2 text-sm font-medium text-foreground">
                     {{ genTitleFromField(entry) }}
                   </div>
@@ -1399,41 +2153,49 @@ const getTagsFromPosts = computed(() => {
                     >
                   </div>
                 </div>
-                <div v-else-if="entry.meta?.option">
+                <div v-else-if="entry.meta?.option" @focusin="setActivePreviewField(entry.field)" @mousedown.capture="setActivePreviewField(entry.field)">
+                  <!-- <cms-publication-picker-field
+                    v-if="entry.meta.option?.picker === 'publication'"
+                    v-model="state.draft[entry.field]"
+                    :option="entry.meta.option"
+                    :label="genTitleFromField(entry)"
+                  /> -->
                   <edge-cms-options-select
                     v-model="state.draft[entry.field]"
                     :option="entry.meta.option"
                     :label="genTitleFromField(entry)"
                   />
                 </div>
-                <div v-else>
+                <div v-else @focusin="setActivePreviewField(entry.field)" @mousedown.capture="setActivePreviewField(entry.field)">
                   <edge-cms-block-input
                     v-model="state.draft[entry.field]"
                     :type="entry.meta.type"
                     :field="entry.field"
+                    :site="props.siteId"
                     :label="genTitleFromField(entry)"
                   />
                 </div>
               </template>
-            </div>
-
-            <div class="sticky bottom-0 bg-background px-6 pb-4 pt-2">
-              <Alert v-if="state.validationErrors.length" variant="destructive" class="mb-3">
-                <AlertTitle>Fix the highlighted fields</AlertTitle>
-                <AlertDescription class="text-sm">
-                  <div v-for="(error, index) in state.validationErrors" :key="`${error}-${index}`">
-                    {{ error }}
-                  </div>
-                </AlertDescription>
-              </Alert>
-              <SheetFooter class="flex justify-between">
-                <edge-shad-button variant="destructive" class="text-white" @click="state.open = false">
-                  Cancel
-                </edge-shad-button>
-                <edge-shad-button class=" bg-slate-800 hover:bg-slate-400 w-full" @click="save">
-                  Save changes
-                </edge-shad-button>
-              </SheetFooter>
+                </div>
+                <div :class="props.editMode ? 'shrink-0 border-t border-border bg-card px-4 py-3' : 'sticky bottom-0 bg-background px-6 pb-4 pt-2'">
+                  <Alert v-if="state.validationErrors.length" variant="destructive" class="mb-3">
+                    <AlertTitle>Fix the highlighted fields</AlertTitle>
+                    <AlertDescription class="text-sm">
+                      <div v-for="(error, index) in state.validationErrors" :key="`${error}-${index}`">
+                        {{ error }}
+                      </div>
+                    </AlertDescription>
+                  </Alert>
+                  <SheetFooter class="flex justify-between">
+                    <edge-shad-button variant="destructive" class="text-white" @click="state.open = false">
+                      Cancel
+                    </edge-shad-button>
+                    <edge-shad-button class="w-full bg-slate-700 text-white hover:bg-slate-800 dark:bg-slate-200 dark:text-slate-900 dark:hover:bg-slate-300" @click="save">
+                      Save changes
+                    </edge-shad-button>
+                  </SheetFooter>
+                </div>
+              </div>
             </div>
           </edge-shad-form>
 
@@ -1518,5 +2280,19 @@ const getTagsFromPosts = computed(() => {
 .cms-nav-edit-static :deep([data-cms-nav-root] .cms-nav-panel) {
   display: none !important;
   pointer-events: none !important;
+}
+
+:deep([data-cms-preview-highlight='text']) {
+  display: inline-block;
+  border-radius: 0.375rem;
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 0.95);
+  background: rgb(59 130 246 / 0.08);
+  padding: 0.08em 0.2em;
+}
+
+:deep([data-cms-preview-highlight='element']) {
+  border-radius: 0.375rem;
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 0.95);
+  background: rgb(59 130 246 / 0.08);
 }
 </style>

@@ -1,22 +1,6 @@
 <script setup>
 import { Plus } from 'lucide-vue-next'
 
-const SHARED_PICKER_STATE = reactive({
-  hostId: null,
-  open: false,
-  activeInstance: null,
-  activeProps: {
-    siteId: '',
-    theme: null,
-    viewportMode: 'auto',
-  },
-  blocksLoaded: [],
-  selectedTags: ['Quick Picks'],
-})
-
-const HANDLERS = new Map()
-let blocksSnapshotStarted = false
-
 const props = defineProps({
   blockOverride: {
     type: Object,
@@ -38,9 +22,35 @@ const props = defineProps({
     type: String,
     default: 'auto',
   },
+  allowedTypes: {
+    type: [String, Array],
+    default: () => [],
+  },
+  renderContext: {
+    type: Object,
+    default: null,
+  },
 })
 
 const emit = defineEmits(['pick'])
+
+const SHARED_PICKER_STATE = reactive({
+  hostId: null,
+  open: false,
+  activeInstance: null,
+  activeProps: {
+    siteId: '',
+    theme: null,
+    viewportMode: 'auto',
+    allowedTypes: [],
+    renderContext: null,
+  },
+  blocksLoaded: [],
+  selectedTags: ['Quick Picks'],
+})
+
+const HANDLERS = new Map()
+let blocksSnapshotStarted = false
 
 const localState = reactive({
   open: false,
@@ -53,7 +63,9 @@ const instanceId = Symbol('blockPicker')
 
 const edgeFirebase = inject('edgeFirebase')
 
-const activeState = computed(() => isSharedMode.value ? SHARED_PICKER_STATE : localState)
+const activeState = computed(() => {
+  return isSharedMode.value ? SHARED_PICKER_STATE : localState
+})
 const pickerState = activeState
 
 const sheetOpen = computed({
@@ -68,10 +80,16 @@ const sheetOpen = computed({
 
 const isSharedHost = computed(() => isSharedMode.value && SHARED_PICKER_STATE.hostId === instanceId)
 
-const activeProps = computed(() => isSharedMode.value ? SHARED_PICKER_STATE.activeProps : {
-  siteId: props.siteId,
-  theme: props.theme,
-  viewportMode: props.viewportMode,
+const activeProps = computed(() => {
+  if (isSharedMode.value)
+    return SHARED_PICKER_STATE.activeProps
+  return {
+    siteId: props.siteId,
+    theme: props.theme,
+    viewportMode: props.viewportMode,
+    allowedTypes: props.allowedTypes,
+    renderContext: props.renderContext,
+  }
 })
 
 const themeId = computed(() => {
@@ -85,6 +103,7 @@ const themeId = computed(() => {
 const activeSiteId = computed(() => activeProps.value.siteId || '')
 const pickerTheme = computed(() => activeProps.value.theme || null)
 const pickerViewport = computed(() => activeProps.value.viewportMode || 'auto')
+const pickerRenderContext = computed(() => activeProps.value.renderContext || null)
 
 const normalizePreviewType = (value) => {
   return value === 'dark' ? 'dark' : 'light'
@@ -94,6 +113,38 @@ const previewSurfaceClass = (value) => {
   return normalizePreviewType(value) === 'light'
     ? 'bg-white text-black'
     : 'bg-neutral-950 text-neutral-50'
+}
+
+const normalizeBlockTypes = (value, { fallbackToPage = true } = {}) => {
+  const hasExplicitTypeValue = !(
+    value === undefined
+    || value === null
+    || value === ''
+    || (Array.isArray(value) && value.length === 0)
+  )
+  const rawTypes = Array.isArray(value) ? value : [value]
+  const normalized = rawTypes
+    .map((typeValue) => {
+      if (typeValue && typeof typeValue === 'object') {
+        const objectValue = typeValue.name ?? typeValue.value ?? typeValue.title ?? typeValue.label ?? ''
+        return String(objectValue || '')
+      }
+      return String(typeValue || '')
+    })
+    .map(typeValue => typeValue.trim().toLowerCase())
+    .map((typeValue) => {
+      if (typeValue === 'page')
+        return 'Page'
+      if (typeValue === 'post')
+        return 'Post'
+      return ''
+    })
+    .filter(Boolean)
+
+  const uniqueNormalized = [...new Set(normalized)]
+  if (!uniqueNormalized.length && fallbackToPage && !hasExplicitTypeValue)
+    return ['Page']
+  return uniqueNormalized
 }
 
 const blockOverridePreviewType = computed(() => {
@@ -116,6 +167,13 @@ const blocks = computed(() => {
   }
   if (themeId.value) {
     blocks = blocks.filter(block => block.themes && block.themes.includes(themeId.value))
+  }
+  const allowedTypes = normalizeBlockTypes(activeProps.value.allowedTypes, { fallbackToPage: false })
+  if (allowedTypes.length) {
+    blocks = blocks.filter((block) => {
+      const blockTypes = normalizeBlockTypes(block?.type)
+      return blockTypes.some(type => allowedTypes.includes(type))
+    })
   }
   return blocks
 })
@@ -229,6 +287,8 @@ const openPicker = () => {
       siteId: props.siteId,
       theme: props.theme,
       viewportMode: props.viewportMode,
+      allowedTypes: props.allowedTypes,
+      renderContext: props.renderContext,
     }
     if (!SHARED_PICKER_STATE.hostId)
       SHARED_PICKER_STATE.hostId = instanceId
@@ -342,6 +402,8 @@ const clearTagFilters = () => {
       :theme="pickerTheme"
       :site-id="activeSiteId"
       :viewport-mode="pickerViewport"
+      :render-context="pickerRenderContext"
+      :standalone-preview="true"
       @pending="blockLoaded($event, 'block')"
     />
       <edge-cms-block-render
@@ -352,6 +414,8 @@ const clearTagFilters = () => {
         :theme="pickerTheme"
         :site-id="activeSiteId"
         :viewport-mode="pickerViewport"
+        :render-context="pickerRenderContext"
+        :standalone-preview="true"
       />
   </div>
   <div v-else-if="props.listOnly" class="p-6 h-[calc(100vh-50px)] overflow-hidden flex flex-col gap-4">
@@ -360,8 +424,10 @@ const clearTagFilters = () => {
         v-for="tagOption in getTagsFromBlocks"
         :key="tagOption.name"
         type="button"
-        class="px-3 py-1 rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-        :class="pickerState.selectedTags.includes(tagOption.name) ? 'bg-primary text-primary-foreground border-primary shadow-sm' : 'bg-background text-muted-foreground hover:bg-muted border-border'"
+        class="px-3 py-1 rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/70 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-slate-300/70 dark:focus-visible:ring-offset-slate-950"
+        :class="pickerState.selectedTags.includes(tagOption.name)
+          ? 'border-slate-700 bg-slate-800 text-white shadow-sm dark:border-slate-200 dark:bg-slate-100 dark:text-slate-900'
+          : 'border-slate-300 bg-slate-100 text-slate-700 hover:bg-slate-200 dark:border-slate-700 dark:bg-slate-900/70 dark:text-slate-300 dark:hover:bg-slate-800'"
         @click="toggleTag(tagOption.name)"
       >
         {{ tagOption.title }}
@@ -369,7 +435,7 @@ const clearTagFilters = () => {
       <button
         v-if="hasActiveFilters"
         type="button"
-        class="ml-auto px-3 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground border border-transparent hover:text-primary hover:border-primary/30 rounded-full transition-colors"
+        class="ml-auto rounded-full border border-transparent px-3 py-1 text-xs font-medium uppercase tracking-wide text-slate-500 transition-colors hover:border-slate-400/60 hover:text-slate-700 dark:text-slate-400 dark:hover:border-slate-500/60 dark:hover:text-slate-200"
         @click="clearTagFilters"
       >
         Clear filters
@@ -393,7 +459,7 @@ const clearTagFilters = () => {
                 <div class="text-4xl relative text-inherit text-center">
                   {{ block.name }}
                 </div>
-                <edge-cms-block-api :site-id="activeSiteId" :content="block.content" :theme="pickerTheme" :values="block.values" :meta="block.meta" :viewport-mode="pickerViewport" @pending="blockLoaded($event, block.docId)" />
+                <edge-cms-block-api :site-id="activeSiteId" :content="block.content" :theme="pickerTheme" :values="block.values" :meta="block.meta" :viewport-mode="pickerViewport" :render-context="pickerRenderContext" :standalone-preview="true" @pending="blockLoaded($event, block.docId)" />
                 <edge-cms-block-render
                   v-if="!pickerState.blocksLoaded.includes(block.docId)"
                   :content="loadingRender(block.content)"
@@ -401,6 +467,8 @@ const clearTagFilters = () => {
                   :meta="block.meta"
                   :theme="pickerTheme"
                   :viewport-mode="pickerViewport"
+                  :render-context="pickerRenderContext"
+                  :standalone-preview="true"
                 />
               </div>
             </div>
@@ -436,8 +504,10 @@ const clearTagFilters = () => {
                 v-for="tagOption in getTagsFromBlocks"
                 :key="tagOption.name"
                 type="button"
-                class="px-3 py-1 rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                :class="pickerState.selectedTags.includes(tagOption.name) ? 'bg-primary text-primary-foreground border-primary shadow-sm' : 'bg-background text-muted-foreground hover:bg-muted border-border'"
+                class="px-3 py-1 rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/70 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-slate-300/70 dark:focus-visible:ring-offset-slate-950"
+                :class="pickerState.selectedTags.includes(tagOption.name)
+                  ? 'border-slate-700 bg-slate-800 text-white shadow-sm dark:border-slate-200 dark:bg-slate-100 dark:text-slate-900'
+                  : 'border-slate-300 bg-slate-100 text-slate-700 hover:bg-slate-200 dark:border-slate-700 dark:bg-slate-900/70 dark:text-slate-300 dark:hover:bg-slate-800'"
                 @click="toggleTag(tagOption.name)"
               >
                 {{ tagOption.title }}
@@ -445,7 +515,7 @@ const clearTagFilters = () => {
               <button
                 v-if="hasActiveFilters"
                 type="button"
-                class="ml-auto px-3 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground border border-transparent hover:text-primary hover:border-primary/30 rounded-full transition-colors"
+                class="ml-auto rounded-full border border-transparent px-3 py-1 text-xs font-medium uppercase tracking-wide text-slate-500 transition-colors hover:border-slate-400/60 hover:text-slate-700 dark:text-slate-400 dark:hover:border-slate-500/60 dark:hover:text-slate-200"
                 @click="clearTagFilters"
               >
                 Clear filters
@@ -470,7 +540,7 @@ const clearTagFilters = () => {
                 <div class="text-4xl relative text-inherit text-center">
                   {{ block.name }}
                 </div>
-                <edge-cms-block-api :site-id="activeSiteId" :content="block.content" :theme="pickerTheme" :values="block.values" :meta="block.meta" :viewport-mode="pickerViewport" @pending="blockLoaded($event, block.docId)" />
+                <edge-cms-block-api :site-id="activeSiteId" :content="block.content" :theme="pickerTheme" :values="block.values" :meta="block.meta" :viewport-mode="pickerViewport" :render-context="pickerRenderContext" :standalone-preview="true" @pending="blockLoaded($event, block.docId)" />
                 <edge-cms-block-render
                   v-if="!pickerState.blocksLoaded.includes(block.docId)"
                   :content="loadingRender(block.content)"
@@ -478,6 +548,8 @@ const clearTagFilters = () => {
                   :meta="block.meta"
                   :theme="pickerTheme"
                   :viewport-mode="pickerViewport"
+                  :render-context="pickerRenderContext"
+                  :standalone-preview="true"
                 />
               </div>
             </div>
