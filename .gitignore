@@ -21,8 +21,3 @@ logs
 .firebase
 edgeFirebaseFramework
 pnpm-lock.yaml
-
-# Remove these after install:
-functions/*
-storage.rules*
-firestore.rules*
