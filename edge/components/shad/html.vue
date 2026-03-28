@@ -6,7 +6,7 @@ import Underline from '@tiptap/extension-underline'
 import ImageExt from '@tiptap/extension-image'
 import { Editor, EditorContent } from '@tiptap/vue-3'
 import { useVModel } from '@vueuse/core'
-import { onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   AlignCenter,
   AlignLeft,
@@ -173,8 +173,19 @@ const imageState = reactive({
   float: 'left',
   width: DEFAULT_IMAGE_WIDTH,
 })
+const sourceMode = ref(false)
+const sourceValue = ref('')
+const sourceTextareaRef = ref(null)
+const sourceGutterRef = ref(null)
+const sourceFormatting = ref(false)
+const sourceLineNumberText = computed(() => {
+  const lineCount = Math.max(1, String(sourceValue.value || '').split('\n').length)
+  return Array.from({ length: lineCount }, (_item, index) => String(index + 1)).join('\n')
+})
 
 const appliedHeightClasses = ref([])
+const toolbarControlClass = 'border border-slate-300 bg-white text-slate-700 shadow-sm hover:border-slate-400 hover:bg-slate-100 hover:text-slate-900 focus-visible:ring-slate-400 disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-50 dark:focus-visible:ring-slate-500 dark:disabled:border-slate-800 dark:disabled:bg-slate-950 dark:disabled:text-slate-600'
+const toolbarToggleClass = `${toolbarControlClass} data-[state=on]:border-slate-900 data-[state=on]:bg-slate-900 data-[state=on]:text-white dark:data-[state=on]:border-slate-100 dark:data-[state=on]:bg-slate-100 dark:data-[state=on]:text-slate-900`
 
 const resolveHeightClasses = () => {
   const raw = (props.heightClass || '').trim()
@@ -223,6 +234,8 @@ const updateImageState = () => {
 watch(modelValue, () => {
   if (!editor.value)
     return
+  if (sourceMode.value)
+    sourceValue.value = String(modelValue.value || '')
   const isSame = editor.value.getHTML() === modelValue.value
 
   // JSON
@@ -235,6 +248,56 @@ watch(modelValue, () => {
   editor.value.commands.setContent(modelValue.value, false)
   updateImageState()
 })
+
+const toggleSourceMode = () => {
+  if (!editor.value)
+    return
+  if (!sourceMode.value) {
+    sourceValue.value = editor.value.getHTML() || ''
+    sourceMode.value = true
+    return
+  }
+  const nextHtml = String(sourceValue.value || '')
+  editor.value.commands.setContent(nextHtml, false)
+  emits('update:modelValue', nextHtml)
+  sourceMode.value = false
+  updateImageState()
+}
+
+const syncSourceScroll = () => {
+  if (!sourceTextareaRef.value || !sourceGutterRef.value)
+    return
+  sourceGutterRef.value.scrollTop = sourceTextareaRef.value.scrollTop
+}
+
+const formatSourceHtml = async () => {
+  if (sourceFormatting.value)
+    return
+  sourceFormatting.value = true
+  try {
+    const prettierModule = await import('prettier/standalone')
+    const parserHtmlModule = await import('prettier/parser-html')
+    const prettier = prettierModule?.format ? prettierModule : (prettierModule?.default || {})
+    const parserHtml = parserHtmlModule?.default || parserHtmlModule
+    if (typeof prettier?.format !== 'function')
+      return
+    const formatted = await prettier.format(String(sourceValue.value || ''), {
+      parser: 'html',
+      plugins: [parserHtml],
+      printWidth: 100,
+      htmlWhitespaceSensitivity: 'css',
+    })
+    sourceValue.value = formatted
+    await nextTick()
+    syncSourceScroll()
+  }
+  catch (error) {
+    console.warn('Failed to format HTML source', error)
+  }
+  finally {
+    sourceFormatting.value = false
+  }
+}
 
 /* const PreventEnterSubmit = Extension.create({
   name: 'preventEnterSubmit',
@@ -299,6 +362,13 @@ onBeforeUnmount(() => {
 
 watch(() => props.heightClass, () => {
   applyHeightClasses()
+})
+
+watch(sourceMode, async (enabled) => {
+  if (!enabled)
+    return
+  await nextTick()
+  syncSourceScroll()
 })
 
 const addImage = () => {
@@ -391,222 +461,268 @@ defineExpose({
           <div v-if="editor" class="relative w-full  items-center">
             <div class="flex flex-col w-full py-2 border border-secondary">
               <div class="button-group w-full flex flex-wrap gap-2">
-                <ToggleGroup type="multiple">
+                <ToggleGroup v-if="enabledToggles.includes('source')" type="single">
                   <ToggleGroupItem
-                    v-if="enabledToggles.includes('bold')"
-                    value="bold"
-                    :disabled="!editor.can().chain().focus().toggleBold().run()"
-                    :data-state="editor.isActive('bold') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleBold().run()"
-                  >
-                    <Bold :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('italic')"
-                    value="italic"
-                    :disabled="!editor.can().chain().focus().toggleItalic().run()"
-                    :data-state="editor.isActive('italic') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleItalic().run()"
-                  >
-                    <Italic :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('underline')"
-                    value="underline"
-                    :disabled="!editor.can().chain().focus().toggleUnderline().run()"
-                    :data-state="editor.isActive('underline') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleUnderline().run()"
-                  >
-                    <UnderlineIcon :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('strike')"
-                    value="strike"
-                    :disabled="!editor.can().chain().focus().toggleStrike().run()"
-                    :data-state="editor.isActive('strike') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleStrike().run()"
-                  >
-                    <Strikethrough :size="16" />
-                  </ToggleGroupItem>
-                </ToggleGroup>
-                <ToggleGroup v-if="enabledToggles.includes('code') || enabledToggles.includes('codeBlock')" type="single">
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('code')"
-                    value="code"
-                    :disabled="!editor.can().chain().focus().toggleCode().run()"
-                    :data-state="editor.isActive('code') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleCode().run()"
+                    value="source"
+                    :data-state="sourceMode ? 'on' : 'off'"
+                    :class="`edge-html-source-toggle ${toolbarToggleClass}`"
+                    title="Toggle HTML source"
+                    @click.prevent="toggleSourceMode"
                   >
                     <Code :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('codeBlock')"
-                    value="codeBlock"
-                    :disabled="!editor.can().chain().focus().toggleCodeBlock().run()"
-                    :data-state="editor.isActive('codeBlock') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleCodeBlock().run()"
-                  >
-                    <SquareCode :size="16" />
+                    <span>HTML</span>
                   </ToggleGroupItem>
                 </ToggleGroup>
-
-                <ToggleGroup
-                  v-if="enabledToggles.includes('heading1') || enabledToggles.includes('heading2') || enabledToggles.includes('heading3') || enabledToggles.includes('heading4') || enabledToggles.includes('heading5') || enabledToggles.includes('heading6')"
-                  type="single"
-                >
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('heading1')"
-                    value="heading1"
-                    :disabled="!editor.can().chain().focus().toggleHeading({ level: 1 }).run()"
-                    :data-state="editor.isActive('heading', { level: 1 }) ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleHeading({ level: 1 }).run()"
-                  >
-                    <Heading1 :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('heading2')"
-                    value="heading2"
-                    :disabled="!editor.can().chain().focus().toggleHeading({ level: 2 }).run()"
-                    :data-state="editor.isActive('heading', { level: 2 }) ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleHeading({ level: 2 }).run()"
-                  >
-                    <Heading2 :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('heading3')"
-                    value="heading3"
-                    :disabled="!editor.can().chain().focus().toggleHeading({ level: 3 }).run()"
-                    :data-state="editor.isActive('heading', { level: 3 }) ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleHeading({ level: 3 }).run()"
-                  >
-                    <Heading3 :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('heading4')"
-                    value="heading4"
-                    :disabled="!editor.can().chain().focus().toggleHeading({ level: 4 }).run()"
-                    :data-state="editor.isActive('heading', { level: 4 }) ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleHeading({ level: 4 }).run()"
-                  >
-                    <Heading4 :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('heading5')"
-                    value="heading5"
-                    :disabled="!editor.can().chain().focus().toggleHeading({ level: 5 }).run()"
-                    :data-state="editor.isActive('heading', { level: 5 }) ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleHeading({ level: 5 }).run()"
-                  >
-                    <Heading5 :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('heading6')"
-                    value="heading6"
-                    :disabled="!editor.can().chain().focus().toggleHeading({ level: 6 }).run()"
-                    :data-state="editor.isActive('heading', { level: 6 }) ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleHeading({ level: 6 }).run()"
-                  >
-                    <Heading6 :size="16" />
-                  </ToggleGroupItem>
-                </ToggleGroup>
-
                 <Button
-                  v-if="enabledToggles.includes('paragraph')"
+                  v-if="sourceMode"
                   variant="outline"
-                  :data-state="editor.isActive('paragraph') ? 'on' : 'off'"
-                  @click.prevent="editor.chain().focus().setParagraph().run()"
+                  :class="toolbarControlClass"
+                  title="Format HTML"
+                  :disabled="sourceFormatting"
+                  @click.prevent="formatSourceHtml"
                 >
-                  <Pilcrow :size="16" />
+                  Format HTML
                 </Button>
+                <template v-if="!sourceMode">
+                  <ToggleGroup type="multiple">
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('bold')"
+                      value="bold"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleBold().run()"
+                      :data-state="editor.isActive('bold') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleBold().run()"
+                    >
+                      <Bold :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('italic')"
+                      value="italic"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleItalic().run()"
+                      :data-state="editor.isActive('italic') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleItalic().run()"
+                    >
+                      <Italic :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('underline')"
+                      value="underline"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleUnderline().run()"
+                      :data-state="editor.isActive('underline') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleUnderline().run()"
+                    >
+                      <UnderlineIcon :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('strike')"
+                      value="strike"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleStrike().run()"
+                      :data-state="editor.isActive('strike') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleStrike().run()"
+                    >
+                      <Strikethrough :size="16" />
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                  <ToggleGroup v-if="enabledToggles.includes('code') || enabledToggles.includes('codeBlock')" type="single">
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('code')"
+                      value="code"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleCode().run()"
+                      :data-state="editor.isActive('code') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleCode().run()"
+                    >
+                      <Code :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('codeBlock')"
+                      value="codeBlock"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleCodeBlock().run()"
+                      :data-state="editor.isActive('codeBlock') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleCodeBlock().run()"
+                    >
+                      <SquareCode :size="16" />
+                    </ToggleGroupItem>
+                  </ToggleGroup>
 
-                <Button
-                  v-if="enabledToggles.includes('image')"
-                  variant="outline"
-                  @click.prevent="addImage"
-                >
-                  <Image :size="16" />
-                </Button>
-
-                <ToggleGroup type="single">
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('bulletlist')"
-                    value="bulletList"
-                    :disabled="!editor.can().chain().focus().toggleBulletList().run()"
-                    :data-state="editor.isActive('bulletList') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleBulletList().run()"
+                  <ToggleGroup
+                    v-if="enabledToggles.includes('heading1') || enabledToggles.includes('heading2') || enabledToggles.includes('heading3') || enabledToggles.includes('heading4') || enabledToggles.includes('heading5') || enabledToggles.includes('heading6')"
+                    type="single"
                   >
-                    <List :size="16" />
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    v-if="enabledToggles.includes('orderedlist')"
-                    value="orderedList"
-                    :disabled="!editor.can().chain().focus().toggleOrderedList().run()"
-                    :data-state="editor.isActive('orderedList') ? 'on' : 'off'"
-                    @click.prevent="editor.chain().focus().toggleOrderedList().run()"
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('heading1')"
+                      value="heading1"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleHeading({ level: 1 }).run()"
+                      :data-state="editor.isActive('heading', { level: 1 }) ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleHeading({ level: 1 }).run()"
+                    >
+                      <Heading1 :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('heading2')"
+                      value="heading2"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleHeading({ level: 2 }).run()"
+                      :data-state="editor.isActive('heading', { level: 2 }) ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleHeading({ level: 2 }).run()"
+                    >
+                      <Heading2 :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('heading3')"
+                      value="heading3"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleHeading({ level: 3 }).run()"
+                      :data-state="editor.isActive('heading', { level: 3 }) ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleHeading({ level: 3 }).run()"
+                    >
+                      <Heading3 :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('heading4')"
+                      value="heading4"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleHeading({ level: 4 }).run()"
+                      :data-state="editor.isActive('heading', { level: 4 }) ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleHeading({ level: 4 }).run()"
+                    >
+                      <Heading4 :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('heading5')"
+                      value="heading5"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleHeading({ level: 5 }).run()"
+                      :data-state="editor.isActive('heading', { level: 5 }) ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleHeading({ level: 5 }).run()"
+                    >
+                      <Heading5 :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('heading6')"
+                      value="heading6"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleHeading({ level: 6 }).run()"
+                      :data-state="editor.isActive('heading', { level: 6 }) ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleHeading({ level: 6 }).run()"
+                    >
+                      <Heading6 :size="16" />
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+
+                  <Button
+                    v-if="enabledToggles.includes('paragraph')"
+                    variant="outline"
+                    :class="toolbarToggleClass"
+                    :data-state="editor.isActive('paragraph') ? 'on' : 'off'"
+                    @click.prevent="editor.chain().focus().setParagraph().run()"
                   >
-                    <ListOrdered :size="16" />
-                  </ToggleGroupItem>
-                </ToggleGroup>
+                    <Pilcrow :size="16" />
+                  </Button>
 
-                <Button variant="outline" title="Clear formatting" @click.prevent="editor.chain().focus().unsetAllMarks().run()">
-                  <RemoveFormatting :size="16" />
-                </Button>
+                  <Button
+                    v-if="enabledToggles.includes('image')"
+                    variant="outline"
+                    :class="toolbarControlClass"
+                    @click.prevent="addImage"
+                  >
+                    <Image :size="16" />
+                  </Button>
 
-                <Button variant="outline" title="Clear / Flatten Structure" @click.prevent="editor.chain().focus().clearNodes().run()">
-                  <ListTree :size="16" />
-                </Button>
+                  <ToggleGroup type="single">
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('bulletlist')"
+                      value="bulletList"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleBulletList().run()"
+                      :data-state="editor.isActive('bulletList') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleBulletList().run()"
+                    >
+                      <List :size="16" />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      v-if="enabledToggles.includes('orderedlist')"
+                      value="orderedList"
+                      :class="toolbarToggleClass"
+                      :disabled="!editor.can().chain().focus().toggleOrderedList().run()"
+                      :data-state="editor.isActive('orderedList') ? 'on' : 'off'"
+                      @click.prevent="editor.chain().focus().toggleOrderedList().run()"
+                    >
+                      <ListOrdered :size="16" />
+                    </ToggleGroupItem>
+                  </ToggleGroup>
 
-                <Toggle
-                  v-if="enabledToggles.includes('blockquote')"
-                  :disabled="!editor.can().chain().focus().toggleBlockquote().run()"
-                  :data-state="editor.isActive('blockQuote') ? 'on' : 'off'"
-                  @click.prevent="editor.chain().focus().toggleBlockquote().run()"
-                >
-                  <TextQuote :size="16" />
-                </Toggle>
+                  <Button variant="outline" :class="toolbarControlClass" title="Clear formatting" @click.prevent="editor.chain().focus().unsetAllMarks().run()">
+                    <RemoveFormatting :size="16" />
+                  </Button>
 
-                <Button
-                  v-if="enabledToggles.includes('horizontalrule')"
-                  variant="outline"
-                  title="Horizontal Rule"
-                  @click.prevent="editor.chain().focus().setHorizontalRule().run()"
-                >
-                  <Minus :size="16" />
-                </Button>
+                  <Button variant="outline" :class="toolbarControlClass" title="Clear / Flatten Structure" @click.prevent="editor.chain().focus().clearNodes().run()">
+                    <ListTree :size="16" />
+                  </Button>
 
-                <Button
-                  v-if="enabledToggles.includes('hardbreak')"
-                  variant="outline"
-                  title="Hard Break"
-                  @click.prevent="editor.chain().focus().setHardBreak().run()"
-                >
-                  <WrapText :size="16" />
-                </Button>
+                  <Toggle
+                    v-if="enabledToggles.includes('blockquote')"
+                    :class="toolbarToggleClass"
+                    :disabled="!editor.can().chain().focus().toggleBlockquote().run()"
+                    :data-state="editor.isActive('blockQuote') ? 'on' : 'off'"
+                    @click.prevent="editor.chain().focus().toggleBlockquote().run()"
+                  >
+                    <TextQuote :size="16" />
+                  </Toggle>
 
-                <Button
-                  variant="outline"
-                  title="Undo"
-                  :disabled="!editor.can().chain().focus().undo().run()"
-                  @click.prevent="editor.chain().focus().undo().run()"
-                >
-                  <Undo :size="16" />
-                </Button>
-                <Button
-                  variant="outline"
-                  title="Redo"
-                  :disabled="!editor.can().chain().focus().redo().run()"
-                  @click.prevent="editor.chain().focus().redo().run()"
-                >
-                  <Redo :size="16" />
-                </Button>
+                  <Button
+                    v-if="enabledToggles.includes('horizontalrule')"
+                    variant="outline"
+                    :class="toolbarControlClass"
+                    title="Horizontal Rule"
+                    @click.prevent="editor.chain().focus().setHorizontalRule().run()"
+                  >
+                    <Minus :size="16" />
+                  </Button>
+
+                  <Button
+                    v-if="enabledToggles.includes('hardbreak')"
+                    variant="outline"
+                    :class="toolbarControlClass"
+                    title="Hard Break"
+                    @click.prevent="editor.chain().focus().setHardBreak().run()"
+                  >
+                    <WrapText :size="16" />
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    :class="toolbarControlClass"
+                    title="Undo"
+                    :disabled="!editor.can().chain().focus().undo().run()"
+                    @click.prevent="editor.chain().focus().undo().run()"
+                  >
+                    <Undo :size="16" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    :class="toolbarControlClass"
+                    title="Redo"
+                    :disabled="!editor.can().chain().focus().redo().run()"
+                    @click.prevent="editor.chain().focus().redo().run()"
+                  >
+                    <Redo :size="16" />
+                  </Button>
+                </template>
               </div>
               <div
-                v-if="enabledToggles.includes('image') && imageState.active"
+                v-if="!sourceMode && enabledToggles.includes('image') && imageState.active"
                 class="flex flex-wrap items-center gap-2 border-t border-secondary/60 px-2 pt-2 mt-2"
               >
                 <ToggleGroup type="single">
                   <ToggleGroupItem
                     value="imageSizeSmall"
+                    :class="toolbarToggleClass"
                     :data-state="imageState.size === 'small' ? 'on' : 'off'"
                     title="Small image"
                     @click.prevent="setImageSize('small')"
@@ -615,6 +731,7 @@ defineExpose({
                   </ToggleGroupItem>
                   <ToggleGroupItem
                     value="imageSizeMedium"
+                    :class="toolbarToggleClass"
                     :data-state="imageState.size === 'medium' ? 'on' : 'off'"
                     title="Medium image"
                     @click.prevent="setImageSize('medium')"
@@ -623,6 +740,7 @@ defineExpose({
                   </ToggleGroupItem>
                   <ToggleGroupItem
                     value="imageSizeLarge"
+                    :class="toolbarToggleClass"
                     :data-state="imageState.size === 'large' ? 'on' : 'off'"
                     title="Large image"
                     @click.prevent="setImageSize('large')"
@@ -631,6 +749,7 @@ defineExpose({
                   </ToggleGroupItem>
                   <ToggleGroupItem
                     value="imageSizeFull"
+                    :class="toolbarToggleClass"
                     :data-state="imageState.size === 'full' ? 'on' : 'off'"
                     title="Full width image"
                     @click.prevent="setImageSize('full')"
@@ -641,6 +760,7 @@ defineExpose({
                 <ToggleGroup type="single">
                   <ToggleGroupItem
                     value="imageFloatLeft"
+                    :class="toolbarToggleClass"
                     :data-state="imageState.float === 'left' ? 'on' : 'off'"
                     title="Float left"
                     @click.prevent="setImageFloat('left')"
@@ -649,6 +769,7 @@ defineExpose({
                   </ToggleGroupItem>
                   <ToggleGroupItem
                     value="imageFloatNone"
+                    :class="toolbarToggleClass"
                     :data-state="imageState.float === 'none' ? 'on' : 'off'"
                     title="No float"
                     @click.prevent="setImageFloat('none')"
@@ -657,6 +778,7 @@ defineExpose({
                   </ToggleGroupItem>
                   <ToggleGroupItem
                     value="imageFloatRight"
+                    :class="toolbarToggleClass"
                     :data-state="imageState.float === 'right' ? 'on' : 'off'"
                     title="Float right"
                     @click.prevent="setImageFloat('right')"
@@ -683,6 +805,7 @@ defineExpose({
                 </div>
                 <Button
                   variant="outline"
+                  :class="toolbarControlClass"
                   title="Remove image"
                   @click.prevent="removeImage"
                 >
@@ -691,10 +814,21 @@ defineExpose({
               </div>
             </div>
             <EditorContent
+              v-if="!sourceMode"
               class="border border-secondary bg-background"
               :editor="editor"
               v-bind="componentField"
             />
+            <div v-else class="edge-source-editor">
+              <pre ref="sourceGutterRef" class="edge-source-gutter" aria-hidden="true">{{ sourceLineNumberText }}</pre>
+              <textarea
+                ref="sourceTextareaRef"
+                v-model="sourceValue"
+                class="edge-source-textarea"
+                spellcheck="false"
+                @scroll="syncSourceScroll"
+              />
+            </div>
             <span class="absolute end-0 inset-y-0 flex items-center justify-center px-2">
               <slot name="icon" />
             </span>
@@ -879,5 +1013,51 @@ defineExpose({
 .tiptap.edge-editor-height-default {
   min-height: 300px;
   max-height: 300px;
+}
+
+.edge-source-editor {
+  display: flex;
+  min-height: 300px;
+  max-height: 300px;
+  overflow: hidden;
+  border: 1px solid hsl(var(--secondary));
+  background: #0b1220;
+  color: #e5e7eb;
+}
+
+.edge-source-gutter {
+  margin: 0;
+  min-width: 48px;
+  padding: 12px 10px;
+  border-right: 1px solid #243047;
+  background: #0f172a;
+  color: #7b879b;
+  font-family: 'JetBrainsMono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: right;
+  user-select: none;
+  overflow: hidden;
+}
+
+.edge-source-textarea {
+  flex: 1;
+  min-height: 100%;
+  max-height: 100%;
+  resize: none;
+  border: 0;
+  background: transparent;
+  color: #e5e7eb;
+  padding: 12px;
+  font-family: 'JetBrainsMono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  outline: none;
+  overflow: auto;
+  white-space: pre;
+}
+
+.edge-html-source-toggle svg {
+  stroke: currentColor;
 }
 </style>

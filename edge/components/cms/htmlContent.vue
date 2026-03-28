@@ -29,11 +29,32 @@ const props = defineProps({
     type: String,
     default: 'auto',
   },
+  standalonePreview: {
+    type: Boolean,
+    default: false,
+  },
 })
 
 const emit = defineEmits(['loaded'])
 
 const scopeId = `hc-${Math.random().toString(36).slice(2)}`
+const SANITIZE_OPTIONS = {
+  ADD_TAGS: ['iframe'],
+  ADD_ATTR: [
+    'class',
+    'style',
+    'src',
+    'title',
+    'width',
+    'height',
+    'allow',
+    'allowfullscreen',
+    'loading',
+    'referrerpolicy',
+    'sandbox',
+    'frameborder',
+  ],
+}
 
 const themeExtraCSS = computed(() => {
   const value = props.theme?.extraCSS
@@ -196,6 +217,182 @@ function setGlobalThemeVars(theme) {
   window.__htmlcontentGlobalTheme = true
 }
 
+function splitTopLevelSelectors(selectorText) {
+  const parts = []
+  let current = ''
+  let parenDepth = 0
+  let bracketDepth = 0
+  let inString = ''
+
+  for (let i = 0; i < selectorText.length; i++) {
+    const char = selectorText[i]
+    const prevChar = selectorText[i - 1]
+
+    if (inString) {
+      current += char
+      if (char === inString && prevChar !== '\\')
+        inString = ''
+      continue
+    }
+
+    if (char === '"' || char === '\'') {
+      inString = char
+      current += char
+      continue
+    }
+
+    if (char === '(') {
+      parenDepth++
+      current += char
+      continue
+    }
+
+    if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1)
+      current += char
+      continue
+    }
+
+    if (char === '[') {
+      bracketDepth++
+      current += char
+      continue
+    }
+
+    if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+      current += char
+      continue
+    }
+
+    if (char === ',' && parenDepth === 0 && bracketDepth === 0) {
+      if (current.trim())
+        parts.push(current.trim())
+      current = ''
+      continue
+    }
+
+    current += char
+  }
+
+  if (current.trim())
+    parts.push(current.trim())
+
+  return parts
+}
+
+function prefixScopedSelector(selector, scopeSelector) {
+  const trimmed = String(selector || '').trim()
+  if (!trimmed)
+    return ''
+  if (trimmed.includes(scopeSelector))
+    return trimmed
+  if (trimmed === ':root' || trimmed === 'html' || trimmed === 'body')
+    return scopeSelector
+
+  const normalized = trimmed
+    .replace(/\b:root\b/g, scopeSelector)
+    .replace(/\bhtml\b/g, scopeSelector)
+    .replace(/\bbody\b/g, scopeSelector)
+
+  if (normalized !== trimmed)
+    return normalized
+
+  return `${scopeSelector} ${trimmed}`
+}
+
+function scopeCssText(cssText, scopeId) {
+  const source = String(cssText || '')
+  const scopeSelector = `[data-theme-scope="${scopeId}"].block-content`
+  if (!source.trim() || !scopeId)
+    return source
+
+  const recurse = (input) => {
+    let output = ''
+    let index = 0
+
+    while (index < input.length) {
+      const openIndex = input.indexOf('{', index)
+      if (openIndex === -1) {
+        output += input.slice(index)
+        break
+      }
+
+      const prelude = input.slice(index, openIndex)
+      let depth = 1
+      let cursor = openIndex + 1
+      let inString = ''
+
+      while (cursor < input.length && depth > 0) {
+        const char = input[cursor]
+        const prevChar = input[cursor - 1]
+        if (inString) {
+          if (char === inString && prevChar !== '\\')
+            inString = ''
+          cursor++
+          continue
+        }
+        if (char === '"' || char === '\'') {
+          inString = char
+          cursor++
+          continue
+        }
+        if (char === '{')
+          depth++
+        else if (char === '}')
+          depth--
+        cursor++
+      }
+
+      if (depth !== 0) {
+        output += input.slice(index)
+        break
+      }
+
+      const inner = input.slice(openIndex + 1, cursor - 1)
+      const trimmedPrelude = prelude.trim()
+
+      if (trimmedPrelude.startsWith('@')) {
+        const atRuleName = trimmedPrelude.match(/^@([a-zA-Z-]+)/)?.[1]?.toLowerCase() || ''
+        const shouldRecurse = ['media', 'supports', 'layer', 'container', 'scope', 'document'].includes(atRuleName)
+        output += `${prelude}{${shouldRecurse ? recurse(inner) : inner}}`
+      }
+      else {
+        const scopedPrelude = splitTopLevelSelectors(prelude)
+          .map(selector => prefixScopedSelector(selector, scopeSelector))
+          .filter(Boolean)
+          .join(', ')
+        output += `${scopedPrelude}{${inner}}`
+      }
+
+      index = cursor
+    }
+
+    return output
+  }
+
+  return recurse(source)
+}
+
+function setScopedExtraCss(scopeEl, cssText) {
+  if (!scopeEl || typeof document === 'undefined')
+    return
+
+  const scopeId = scopeEl.getAttribute('data-theme-scope')
+  if (!scopeId)
+    return
+
+  const sheetId = `htmlcontent-theme-extra-inline-${scopeId}`
+  let styleEl = scopeEl.querySelector(`#${sheetId}`)
+  if (!styleEl) {
+    styleEl = document.createElement('style')
+    styleEl.id = sheetId
+    scopeEl.prepend(styleEl)
+  }
+
+  styleEl.textContent = scopeCssText(cssText, scopeId)
+}
+
 const hostEl = ref(null)
 let hasMounted = false
 
@@ -210,7 +407,7 @@ const safeHtml = computed(() => {
   const c = props.html || ''
   if (typeof window === 'undefined')
     return c
-  return DOMPurify.sanitize(c, { ADD_ATTR: ['class'] })
+  return DOMPurify.sanitize(c, SANITIZE_OPTIONS)
 })
 
 // Inject theme CSS variables into <head> for SSR + client
@@ -221,7 +418,7 @@ useHead(() => {
   if (themeExtraCSS.value.trim()) {
     style.push({
       id: `htmlcontent-theme-extra-${scopeId}`,
-      children: themeExtraCSS.value,
+      children: scopeCssText(themeExtraCSS.value, scopeId),
     })
   }
   return { style }
@@ -563,17 +760,41 @@ function initCmsNavHelpers(scope) {
       const scrollingCandidate = candidates.find(el => (el.scrollHeight - el.clientHeight) > 1)
       return scrollingCandidate || candidates[0] || previewSurface
     }
-    const previewPinAnchor = resolvePreviewPinAnchor()
-    const previewScrollTarget = resolvePreviewScrollTarget()
+    let previewPinAnchor = resolvePreviewPinAnchor()
+    let previewScrollTarget = resolvePreviewScrollTarget()
+    const refreshPreviewTargets = () => {
+      if (!shouldContainFixedInPreview)
+        return
+      const nextPinAnchor = resolvePreviewPinAnchor()
+      const nextScrollTarget = resolvePreviewScrollTarget()
+      if (nextPinAnchor)
+        previewPinAnchor = nextPinAnchor
+      if (nextScrollTarget)
+        previewScrollTarget = nextScrollTarget
+    }
+    const previewScrollAncestors = previewSurface
+      ? getAncestorElements(previewSurface).filter(isScrollableElement)
+      : []
     const scrollTargets = shouldContainFixedInPreview
-      ? Array.from(new Set([previewScrollTarget, previewPinAnchor, previewSurface].filter(Boolean)))
+      ? Array.from(new Set([previewSurface, previewScrollTarget, previewPinAnchor, ...previewScrollAncestors].filter(Boolean)))
       : collectScrollTargets(root)
     const windowScrollY = () => window.scrollY || document.documentElement.scrollTop || 0
     const readScrollY = () => {
       if (shouldContainFixedInPreview) {
-        const scopedTarget = previewScrollTarget || previewSurface
-        if (scopedTarget && typeof scopedTarget.scrollTop === 'number')
-          return Number(scopedTarget.scrollTop || 0)
+        refreshPreviewTargets()
+        const scopedTargets = Array.from(new Set([previewSurface, previewScrollTarget, previewPinAnchor, ...previewScrollAncestors].filter(Boolean)))
+        let scopedMaxScrollY = 0
+        let hasScopedTarget = false
+        scopedTargets.forEach((target) => {
+          if (!target || target === window || target === document)
+            return
+          if (typeof target.scrollTop !== 'number')
+            return
+          hasScopedTarget = true
+          scopedMaxScrollY = Math.max(scopedMaxScrollY, Number(target.scrollTop || 0))
+        })
+        if (hasScopedTarget)
+          return scopedMaxScrollY
       }
       let maxScrollY = windowScrollY()
       scrollTargets.forEach((target) => {
@@ -587,6 +808,7 @@ function initCmsNavHelpers(scope) {
     }
 
     const readPinAnchorTop = () => {
+      refreshPreviewTargets()
       if (!previewPinAnchor || typeof previewPinAnchor.getBoundingClientRect !== 'function')
         return 0
       return Math.round(previewPinAnchor.getBoundingClientRect().top)
@@ -680,17 +902,28 @@ function initCmsNavHelpers(scope) {
       navMain.style.bottom = ''
     }
 
+    const readPreviewSurfaceScale = () => {
+      if (!previewSurface || typeof window === 'undefined')
+        return 1
+      const zoomValue = previewSurface.style?.zoom || window.getComputedStyle(previewSurface).zoom
+      const parsed = Number.parseFloat(String(zoomValue || '1'))
+      if (!Number.isFinite(parsed) || parsed <= 0)
+        return 1
+      return parsed
+    }
+
     const updatePinnedPreviewPosition = () => {
       if (!shouldPinInsidePreview() || !navMain || !previewSurface)
         return
       const surfaceRect = previewSurface.getBoundingClientRect()
+      const previewScale = readPreviewSurfaceScale()
       if (pinnedViewportTop == null)
         pinnedViewportTop = resolvePinnedTop()
-      navMain.style.left = `${Math.round(surfaceRect.left)}px`
-      navMain.style.width = `${Math.round(surfaceRect.width)}px`
+      navMain.style.left = `${Math.round(surfaceRect.left / previewScale)}px`
+      navMain.style.width = `${Math.round(surfaceRect.width / previewScale)}px`
       navMain.style.right = 'auto'
       navMain.style.bottom = 'auto'
-      navMain.style.top = `${pinnedViewportTop}px`
+      navMain.style.top = `${Math.round(pinnedViewportTop / previewScale)}px`
     }
 
     if (navMain && transitionClassTokens.length) {
@@ -1068,6 +1301,131 @@ function renderSafeHtml(content) {
     // The HTML is already in the DOM via v-html; just (re)wire behaviors
     initEmblaCarousels(hostEl.value)
     initCmsNavHelpers(hostEl.value)
+  }
+}
+
+function getStandalonePreviewContentRoot() {
+  const host = hostEl.value
+  if (!host)
+    return null
+  const children = Array.from(host.children || [])
+  const direct = children.find((child) => {
+    if (!(child instanceof HTMLElement))
+      return false
+    const tag = child.tagName.toLowerCase()
+    return !['style', 'script', 'link', 'meta'].includes(tag)
+  })
+  return direct || host
+}
+
+function getFirstRenderableElement(root) {
+  if (!root || typeof document === 'undefined')
+    return null
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      if (!node || !(node instanceof HTMLElement))
+        return NodeFilter.FILTER_SKIP
+      if (node === root)
+        return NodeFilter.FILTER_SKIP
+      const tag = node.tagName.toLowerCase()
+      if (['script', 'style', 'link', 'meta'].includes(tag))
+        return NodeFilter.FILTER_SKIP
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+  return walker.nextNode()
+}
+
+function resolveStandalonePreviewTargetElement() {
+  const contentRoot = getStandalonePreviewContentRoot()
+  let target = getFirstRenderableElement(contentRoot)
+  if (!target)
+    return null
+
+  for (;;) {
+    const onlyChild = target.children?.length === 1 ? target.firstElementChild : null
+    const ownText = Array.from(target.childNodes || []).some((node) => {
+      return node.nodeType === Node.TEXT_NODE && String(node.textContent || '').trim().length > 0
+    })
+    const hasOwnHooks = target.hasAttribute('data-viewport-base-class')
+      || target.hasAttribute('class')
+      || target.hasAttribute('style')
+      || target.hasAttribute('id')
+
+    if (!onlyChild || ownText || hasOwnHooks)
+      break
+
+    if (!(onlyChild instanceof HTMLElement))
+      break
+
+    const childTag = onlyChild.tagName.toLowerCase()
+    if (['style', 'script', 'link', 'meta'].includes(childTag))
+      break
+
+    target = onlyChild
+  }
+
+  return target
+}
+
+function resetStandalonePreviewOverrides(root) {
+  if (!root)
+    return
+  root.querySelectorAll('[data-cms-standalone-reset-margin-top]').forEach((el) => {
+    el.style.removeProperty('margin-top')
+    el.removeAttribute('data-cms-standalone-reset-margin-top')
+  })
+  root.querySelectorAll('[data-cms-standalone-reset-top]').forEach((el) => {
+    el.style.removeProperty('top')
+    el.removeAttribute('data-cms-standalone-reset-top')
+  })
+  root.querySelectorAll('[data-cms-standalone-reset-translate]').forEach((el) => {
+    el.style.removeProperty('translate')
+    el.removeAttribute('data-cms-standalone-reset-translate')
+  })
+}
+
+function syncStandalonePreviewInset() {
+  const host = hostEl.value
+  if (!host || typeof window === 'undefined')
+    return
+
+  if (!props.standalonePreview) {
+    host.style.removeProperty('padding-top')
+    host.style.removeProperty('display')
+    resetStandalonePreviewOverrides(host)
+    host.removeAttribute('data-cms-standalone-preview')
+    return
+  }
+
+  host.setAttribute('data-cms-standalone-preview', 'true')
+  host.style.removeProperty('padding-top')
+  host.style.display = 'flow-root'
+  resetStandalonePreviewOverrides(host)
+
+  const firstElement = resolveStandalonePreviewTargetElement()
+  if (!firstElement)
+    return
+
+  const computedStyle = window.getComputedStyle(firstElement)
+  const marginTop = Number.parseFloat(computedStyle.marginTop || '0')
+  if (Number.isFinite(marginTop) && marginTop < 0) {
+    firstElement.style.setProperty('margin-top', '0px', 'important')
+    firstElement.setAttribute('data-cms-standalone-reset-margin-top', 'true')
+  }
+
+  const topValue = Number.parseFloat(computedStyle.top || '0')
+  if (computedStyle.position !== 'static' && Number.isFinite(topValue) && topValue < 0) {
+    firstElement.style.setProperty('top', '0px', 'important')
+    firstElement.setAttribute('data-cms-standalone-reset-top', 'true')
+  }
+
+  const hostRect = host.getBoundingClientRect()
+  const adjustedRect = firstElement.getBoundingClientRect()
+  const overflowTop = hostRect.top - adjustedRect.top
+  if (overflowTop > 1) {
+    firstElement.style.setProperty('translate', `0 ${Math.ceil(overflowTop)}px`, 'important')
+    firstElement.setAttribute('data-cms-standalone-reset-translate', 'true')
   }
 }
 
@@ -1459,6 +1817,7 @@ onMounted(async () => {
   // Apply global theme once (keeps one style tag for vars; blocks can still override locally if needed)
   // setGlobalThemeVars(props.theme)
   setScopedThemeVars(hostEl.value, props.theme)
+  setScopedExtraCss(hostEl.value, themeExtraCSS.value)
   // If you later need per-block overrides, keep the next line; otherwise, it can be omitted.
   // setScopedThemeVars(hostEl.value, normalizeTheme(props.theme))
   applyThemeClasses(hostEl.value, props.theme, (props.theme && props.theme.variant) || 'light')
@@ -1467,6 +1826,7 @@ onMounted(async () => {
   initEmblaCarousels(hostEl.value)
   initCmsNavHelpers(hostEl.value)
   await nextTick()
+  syncStandalonePreviewInset()
   hasMounted = true
   notifyLoaded()
 })
@@ -1484,6 +1844,7 @@ watch(
     initEmblaCarousels(hostEl.value)
     initCmsNavHelpers(hostEl.value)
     await nextTick()
+    syncStandalonePreviewInset()
     notifyLoaded()
   },
 )
@@ -1493,11 +1854,13 @@ watch(
   async (val) => {
     // 1) Write scoped CSS variables from the raw theme object
     setScopedThemeVars(hostEl.value, val)
+    setScopedExtraCss(hostEl.value, typeof val?.extraCSS === 'string' ? val.extraCSS : '')
     // 2) Apply classes based on `apply`, `slots`, and optional variants
     applyThemeClasses(hostEl.value, val, (val && val.variant) || 'light')
     rewriteAllClasses(hostEl.value, val, props.isolated, props.viewportMode)
     initCmsNavHelpers(hostEl.value)
     await nextTick()
+    syncStandalonePreviewInset()
     notifyLoaded()
   },
   { immediate: true, deep: true },
@@ -1511,6 +1874,15 @@ watch(
     // Viewport button changes can alter preview surface width without a window resize.
     // Reinitialize nav helpers so fixed nav left/width is recalculated immediately.
     initCmsNavHelpers(hostEl.value)
+    syncStandalonePreviewInset()
+  },
+)
+
+watch(
+  () => props.standalonePreview,
+  async () => {
+    await nextTick()
+    syncStandalonePreviewInset()
   },
 )
 
@@ -1537,10 +1909,6 @@ onBeforeUnmount(() => {
 </template>
 
 <style>
-p {
-  margin-bottom: 1em;
-}
-
 .cms-nav-preview-relative {
   position: relative;
 }

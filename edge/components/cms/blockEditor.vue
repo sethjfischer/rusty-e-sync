@@ -1,5 +1,5 @@
 <script setup>
-import { Download, HelpCircle, Maximize2, Monitor, Smartphone, Tablet } from 'lucide-vue-next'
+import { Download, HelpCircle, History, Loader2, Maximize2, Monitor, RotateCcw, Smartphone, Tablet } from 'lucide-vue-next'
 import { toTypedSchema } from '@vee-validate/zod'
 import * as z from 'zod'
 const props = defineProps({
@@ -12,7 +12,9 @@ const props = defineProps({
 const emit = defineEmits(['head'])
 
 const edgeFirebase = inject('edgeFirebase')
+const { saveJsonFile } = useJsonFileSave()
 const { blocks: blockNewDocSchema } = useCmsNewDocs()
+const blockEditorPostPreviewCache = useState('edge-cms-block-editor-post-preview-cache', () => ({}))
 
 const state = reactive({
   filter: '',
@@ -31,9 +33,22 @@ const state = reactive({
   initialBlocksSeeded: false,
   seedingInitialBlocks: false,
   previewViewport: 'full',
+  previewScale: '100',
   previewBlock: null,
+  previewSourceValues: {},
+  previewRenderContext: null,
   editorWorkingDoc: null,
   themeDefaultAppliedForBlockId: '',
+  editorKey: 0,
+  editorHasUnsavedChanges: false,
+  historyDialogOpen: false,
+  historyLoading: false,
+  historyRestoring: false,
+  historyError: '',
+  historyItems: [],
+  historySelectedId: '',
+  historyPreviewBlock: null,
+  showHistoryDiffDialog: false,
 })
 
 const blockSchema = toTypedSchema(z.object({
@@ -48,16 +63,92 @@ const previewViewportOptions = [
   { id: 'medium', label: 'Medium', width: '992px', icon: Tablet },
   { id: 'mobile', label: 'Mobile', width: '420px', icon: Smartphone },
 ]
+const previewScaleOptions = [
+  { name: '100', title: '100%' },
+  { name: '75', title: '75%' },
+  { name: '50', title: '50%' },
+  { name: '25', title: '25%' },
+]
 const previewTypeOptions = [
   { name: 'light', title: 'Light Preview' },
   { name: 'dark', title: 'Dark Preview' },
+]
+const blockTypeOptions = [
+  { name: 'Page', title: 'Page' },
+  { name: 'Post', title: 'Post' },
 ]
 
 const normalizePreviewType = (value) => {
   return value === 'dark' ? 'dark' : 'light'
 }
 
+function normalizeForCompare(value) {
+  if (Array.isArray(value))
+    return value.map(normalizeForCompare)
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((acc, key) => {
+      acc[key] = normalizeForCompare(value[key])
+      return acc
+    }, {})
+  }
+  return value
+}
+
+function stableSerialize(value) {
+  return JSON.stringify(normalizeForCompare(value))
+}
+
+function areEqualNormalized(a, b) {
+  return stableSerialize(a) === stableSerialize(b)
+}
+
+const normalizeBlockTypes = (value, { fallbackToPage = true } = {}) => {
+  const hasExplicitTypeValue = !(
+    value === undefined
+    || value === null
+    || value === ''
+    || (Array.isArray(value) && value.length === 0)
+  )
+  const rawTypes = Array.isArray(value) ? value : [value]
+  const normalized = rawTypes
+    .map((typeValue) => {
+      if (typeValue && typeof typeValue === 'object') {
+        const objectValue = typeValue.name ?? typeValue.value ?? typeValue.title ?? typeValue.label ?? ''
+        return String(objectValue || '')
+      }
+      return String(typeValue || '')
+    })
+    .map(typeValue => typeValue.trim().toLowerCase())
+    .map((typeValue) => {
+      if (typeValue === 'page')
+        return 'Page'
+      if (typeValue === 'post')
+        return 'Post'
+      return ''
+    })
+    .filter(Boolean)
+  const uniqueNormalized = [...new Set(normalized)]
+  if (!uniqueNormalized.length && fallbackToPage && !hasExplicitTypeValue)
+    return ['Page']
+  return uniqueNormalized
+}
+
+const areTypeArraysEqual = (left, right) => {
+  const a = normalizeBlockTypes(left, { fallbackToPage: false })
+  const b = normalizeBlockTypes(right, { fallbackToPage: false })
+  if (a.length !== b.length)
+    return false
+  return a.every(type => b.includes(type))
+}
+
 const selectedPreviewViewport = computed(() => previewViewportOptions.find(option => option.id === state.previewViewport) || previewViewportOptions[0])
+const previewScaleValue = computed(() => {
+  const parsed = Number.parseInt(String(state.previewScale || '100'), 10)
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return 100
+  return parsed
+})
+const previewScaleMultiplier = computed(() => previewScaleValue.value / 100)
 
 const previewViewportStyle = computed(() => {
   const selected = selectedPreviewViewport.value
@@ -71,6 +162,13 @@ const previewViewportStyle = computed(() => {
   }
 })
 
+const previewViewportContainStyle = computed(() => {
+  return {
+    ...(previewViewportStyle.value || {}),
+    zoom: previewScaleMultiplier.value,
+  }
+})
+
 const setPreviewViewport = (viewportId) => {
   state.previewViewport = viewportId
 }
@@ -81,18 +179,60 @@ const previewViewportMode = computed(() => {
   return state.previewViewport
 })
 
-const previewSurfaceClass = computed(() => {
-  const previewType = normalizePreviewType(state.previewBlock?.previewType)
+const getPreviewSurfaceClass = (block) => {
+  const previewType = normalizePreviewType(block?.previewType)
   return previewType === 'light'
     ? 'bg-white text-black'
     : 'bg-neutral-950 text-neutral-50'
-})
+}
+
+const previewSurfaceClass = computed(() => getPreviewSurfaceClass(state.previewBlock))
 
 const previewCanvasClass = computed(() => {
   const content = String(state.previewBlock?.content || '')
   const hasFixedContent = /\bfixed\b/.test(content)
-  return hasFixedContent ? 'min-h-[calc(100vh-360px)]' : 'min-h-[88px]'
+  return hasFixedContent ? 'h-[calc(100vh-370px)]' : 'h-[calc(100vh-370px)] overflow-y-auto'
 })
+
+const previewBlockTypes = computed(() => normalizeBlockTypes(state.editorWorkingDoc?.type))
+const previewNeedsPostContext = computed(() => previewBlockTypes.value.includes('Post'))
+
+const loadPreviewRenderContext = async () => {
+  if (!previewNeedsPostContext.value) {
+    state.previewRenderContext = null
+    return
+  }
+
+  const siteId = String(edgeGlobal.edgeState.blockEditorSite || '').trim()
+  if (!siteId) {
+    state.previewRenderContext = null
+    return
+  }
+
+  const cacheKey = `${edgeGlobal.edgeState.currentOrganization}:${siteId}`
+  const cached = blockEditorPostPreviewCache.value?.[cacheKey]
+  if (cached && typeof cached === 'object') {
+    state.previewRenderContext = edgeGlobal.dupObject(cached)
+    return
+  }
+
+  try {
+    const staticSearch = new edgeFirebase.SearchStaticData()
+    const collectionPath = `${edgeGlobal.edgeState.organizationDocPath}/sites/${siteId}/published_posts`
+    await staticSearch.getData(collectionPath, [], [], 1)
+    const firstPost = Object.values(staticSearch.results?.data || {})[0] || null
+    if (firstPost && typeof firstPost === 'object') {
+      blockEditorPostPreviewCache.value[cacheKey] = edgeGlobal.dupObject(firstPost)
+      state.previewRenderContext = edgeGlobal.dupObject(firstPost)
+      return
+    }
+  }
+  catch (error) {
+    console.error('Failed to load block editor post preview context', error)
+  }
+
+  state.previewRenderContext = null
+}
 
 onMounted(() => {
   // state.mounted = true
@@ -102,11 +242,6 @@ const PLACEHOLDERS = {
   text: 'Lorem ipsum dolor sit amet.',
   textarea: 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.',
   richtext: '<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>',
-  arrayItem: [
-    'Lorem ipsum dolor sit amet.',
-    'Consectetur adipiscing elit.',
-    'Sed do eiusmod tempor incididunt.',
-  ],
   image: 'https://imagedelivery.net/h7EjKG0X9kOxmLp41mxOng/f1f7f610-dfa9-4011-08a3-7a98d95e7500/thumbnail',
 }
 
@@ -169,6 +304,21 @@ const BLOCK_CONTENT_SNIPPETS = [
   {{child}}
 {{{/subarray}}}`,
     description: 'Nested array inside an array item',
+  },
+  {
+    label: 'Render Blocks',
+    snippet: '{{{#renderBlocks {"field":"item"}}}}',
+    description: 'Render block content from an object field',
+  },
+  {
+    label: 'Post Content Example',
+    snippet: `{{{#array {"field":"list","schema":[{"field":"name","value":"text"},{"field":"content","value":"richtext"}],"collection":{"path":"posts","uniqueKey":"{orgId}:{siteId}","query":[],"order":[]},"queryOptions":[],"limit":3,"value":[]}}}}
+  <article>
+    <h2>{{item.name}}</h2>
+    {{{#renderBlocks {"field":"item"}}}}
+  </article>
+{{{/array}}}`,
+    description: 'Example loop for posts with rendered post blocks',
   },
   {
     label: 'If / Else',
@@ -322,20 +472,8 @@ const blockModel = (html) => {
       val = !val ? PLACEHOLDERS.text : String(val)
     }
     else if (type === 'array') {
-      if (meta[field]?.limit > 0) {
-        val = Array(meta[field].limit).fill('placeholder')
-      }
-      else {
-        if (Array.isArray(val)) {
-          console.log('Array value detected for field:', field, 'with value:', val)
-          if (val.length === 0) {
-            val = PLACEHOLDERS.arrayItem
-          }
-        }
-        else {
-          val = PLACEHOLDERS.arrayItem
-        }
-      }
+      // Keep array fields empty by default instead of injecting placeholder items.
+      val = Array.isArray(val) ? JSON.parse(JSON.stringify(val)) : []
     }
     else if (type === 'textarea') {
       val = !val ? PLACEHOLDERS.textarea : String(val)
@@ -452,13 +590,44 @@ function handleJsonEditorSave() {
 
 const buildPreviewBlock = (workingDoc, parsed) => {
   const content = workingDoc?.content || ''
+  const clonePreviewValue = (value) => {
+    if (Array.isArray(value) || (value && typeof value === 'object'))
+      return edgeGlobal.dupObject(value)
+    return value
+  }
+  const valuesMatch = (a, b) => {
+    if (a === b)
+      return true
+    if ((a && typeof a === 'object') || (b && typeof b === 'object')) {
+      try {
+        return JSON.stringify(a) === JSON.stringify(b)
+      }
+      catch {
+        return false
+      }
+    }
+    return false
+  }
+  const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key)
+  const isSameBlockContext = state.previewBlock?.blockId === props.blockId
   const nextValues = {}
-  const previousValues = state.previewBlock?.values || {}
+  const previousValues = isSameBlockContext ? (state.previewBlock?.values || {}) : {}
+  const previousSourceValues = isSameBlockContext ? (state.previewSourceValues || {}) : {}
   Object.keys(parsed.values || {}).forEach((field) => {
-    if (previousValues[field] !== undefined)
-      nextValues[field] = previousValues[field]
+    const hasPreviousValue = hasOwn(previousValues, field)
+    const hadSourceValue = hasOwn(previousSourceValues, field)
+    if (!hasPreviousValue) {
+      nextValues[field] = clonePreviewValue(parsed.values[field])
+      return
+    }
+
+    const previousValue = previousValues[field]
+    const previousSourceValue = previousSourceValues[field]
+    const followsSource = hadSourceValue && valuesMatch(previousValue, previousSourceValue)
+    if (followsSource)
+      nextValues[field] = clonePreviewValue(parsed.values[field])
     else
-      nextValues[field] = parsed.values[field]
+      nextValues[field] = clonePreviewValue(previousValues[field])
   })
 
   const previousMeta = state.previewBlock?.meta || {}
@@ -466,12 +635,12 @@ const buildPreviewBlock = (workingDoc, parsed) => {
   Object.keys(parsed.meta || {}).forEach((field) => {
     if (previousMeta[field]) {
       nextMeta[field] = {
-        ...previousMeta[field],
-        ...parsed.meta[field],
+        ...clonePreviewValue(previousMeta[field]),
+        ...clonePreviewValue(parsed.meta[field]),
       }
     }
     else {
-      nextMeta[field] = parsed.meta[field]
+      nextMeta[field] = clonePreviewValue(parsed.meta[field])
     }
   })
 
@@ -531,11 +700,48 @@ watch(headObject, (newHeadElements) => {
 }, { immediate: true, deep: true })
 
 const editorDocUpdates = (workingDoc) => {
+  let normalizedTypes = normalizeBlockTypes(workingDoc?.type)
+  if (!normalizedTypes.length)
+    normalizedTypes = ['Page']
+  if (workingDoc && !areTypeArraysEqual(workingDoc.type, normalizedTypes))
+    workingDoc.type = normalizedTypes
   state.editorWorkingDoc = workingDoc || null
-  const parsed = blockModel(workingDoc.content)
-  state.workingDoc = parsed
+  const parsed = blockModel(workingDoc?.content || '')
+  state.workingDoc = {
+    ...parsed,
+    type: normalizedTypes,
+  }
   state.previewBlock = buildPreviewBlock(workingDoc, parsed)
+  state.previewSourceValues = edgeGlobal.dupObject(parsed.values || {})
   console.log('Editor workingDoc update:', state.workingDoc)
+}
+
+const syncEditorStateFromBlockDoc = (doc) => {
+  if (!isPlainObject(doc))
+    return
+
+  const restoredDoc = edgeGlobal.dupObject(doc)
+  let normalizedTypes = normalizeBlockTypes(restoredDoc.type)
+  if (!normalizedTypes.length)
+    normalizedTypes = ['Page']
+  restoredDoc.type = normalizedTypes
+  if (!restoredDoc.docId)
+    restoredDoc.docId = props.blockId
+
+  state.editorWorkingDoc = restoredDoc
+  const parsed = blockModel(restoredDoc.content || '')
+  state.workingDoc = {
+    ...parsed,
+    type: normalizedTypes,
+  }
+  state.previewBlock = buildPreviewBlock(restoredDoc, parsed)
+  state.previewSourceValues = edgeGlobal.dupObject(parsed.values || {})
+  state.editorHasUnsavedChanges = false
+
+  const collectionPath = `${edgeGlobal.edgeState.organizationDocPath}/blocks`
+  if (!edgeFirebase.data?.[collectionPath])
+    edgeFirebase.data[collectionPath] = {}
+  edgeFirebase.data[collectionPath][props.blockId] = edgeGlobal.dupObject(restoredDoc)
 }
 
 onBeforeMount(async () => {
@@ -606,6 +812,14 @@ watch([availableThemeIds, currentBlockAllowedThemeIds, () => props.blockId], asy
   state.loading = false
 }, { immediate: true, deep: true })
 
+watch(
+  [previewNeedsPostContext, () => edgeGlobal.edgeState.blockEditorSite, () => edgeGlobal.edgeState.currentOrganization],
+  async () => {
+    await loadPreviewRenderContext()
+  },
+  { immediate: true },
+)
+
 watch(() => state.jsonEditorOpen, (open) => {
   if (!open)
     resetJsonEditorState()
@@ -633,6 +847,16 @@ const blocks = computed(() => {
   return edgeFirebase.data?.[`${edgeGlobal.edgeState.organizationDocPath}/blocks`] || null
 })
 
+const currentBlock = computed(() => blocks.value?.[props.blockId] || null)
+
+const currentBlockPath = computed(() => {
+  const orgPath = String(edgeGlobal.edgeState.organizationDocPath || '').trim()
+  const blockId = String(props.blockId || '').trim()
+  if (!orgPath || !blockId || blockId === 'new')
+    return ''
+  return `${orgPath}/blocks/${blockId}`
+})
+
 const getTagsFromBlocks = computed(() => {
   const tagsSet = new Set()
 
@@ -654,20 +878,6 @@ const getTagsFromBlocks = computed(() => {
   // Always prepend it
   return [{ name: 'Quick Picks', title: 'Quick Picks' }, ...filtered]
 })
-
-const downloadJsonFile = (payload, filename) => {
-  if (typeof window === 'undefined')
-    return
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
-  const objectUrl = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = objectUrl
-  anchor.download = filename
-  document.body.appendChild(anchor)
-  anchor.click()
-  anchor.remove()
-  URL.revokeObjectURL(objectUrl)
-}
 
 const isPlainObject = value => !!value && typeof value === 'object' && !Array.isArray(value)
 
@@ -697,15 +907,424 @@ const notifyError = (message) => {
   edgeFirebase?.toast?.error?.(message)
 }
 
-const exportCurrentBlock = () => {
+const getHistoryTimestampMs = (value) => {
+  if (typeof value === 'number' && Number.isFinite(value))
+    return value
+  if (typeof value?.millis === 'number' && Number.isFinite(value.millis))
+    return value.millis
+  const isoValue = String(value?.iso || value || '').trim()
+  if (!isoValue)
+    return null
+  const parsed = Date.parse(isoValue)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+const formatHistoryDate = (value) => {
+  const millis = getHistoryTimestampMs(value)
+  if (!millis)
+    return 'Unknown date'
+  return new Date(millis).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+function formatHistoryEntryLabel(item, index = 0) {
+  const dateLabel = formatHistoryDate(item?.createdAt)
+  const fallbackLabel = `Entry ${index + 1}`
+  if (dateLabel)
+    return dateLabel
+  return fallbackLabel
+}
+
+const getHistorySnapshotState = (item) => {
+  if (isPlainObject(item?.afterData))
+    return 'afterData'
+  if (isPlainObject(item?.beforeData))
+    return 'beforeData'
+  return ''
+}
+
+const getHistorySnapshotDoc = item => item?.[getHistorySnapshotState(item)] || null
+
+const buildComparableBlockDiffDoc = (doc) => {
+  if (!doc || typeof doc !== 'object')
+    return null
+  return {
+    name: doc.name ?? '',
+    content: doc.content ?? '',
+    tags: Array.isArray(doc.tags) ? doc.tags : [],
+    type: normalizeBlockTypes(doc.type, { fallbackToPage: false }),
+    themes: Array.isArray(doc.themes) ? doc.themes : [],
+    synced: !!doc.synced,
+    previewType: normalizePreviewType(doc.previewType),
+  }
+}
+
+const blockDocsMatchForDiff = (baseDoc, compareDoc) => {
+  return areTypeArraysEqual(baseDoc?.type, compareDoc?.type) && areEqualNormalized(
+    buildComparableBlockDiffDoc(baseDoc),
+    buildComparableBlockDiffDoc(compareDoc),
+  )
+}
+
+const buildHistoryPreviewBlock = (doc) => {
+  if (!isPlainObject(doc))
+    return null
+  const parsed = blockModel(doc.content || '')
+  return {
+    id: 'history-preview',
+    blockId: props.blockId,
+    name: doc.name || '',
+    previewType: normalizePreviewType(doc.previewType),
+    content: doc.content || '',
+    values: edgeGlobal.dupObject(parsed.values || {}),
+    meta: edgeGlobal.dupObject(parsed.meta || {}),
+    synced: !!doc.synced,
+  }
+}
+
+const isHistoryItemArray = (value) => {
+  if (!Array.isArray(value) || !value.length)
+    return false
+  return value.every((item) => {
+    return item && typeof item === 'object' && (
+      typeof item.historyId === 'string'
+      || typeof item.path === 'string'
+      || typeof item.relativePath === 'string'
+    )
+  })
+}
+
+const extractHistoryItemsFromResponse = (value, visited = new Set()) => {
+  if (!value || typeof value !== 'object')
+    return []
+  if (visited.has(value))
+    return []
+  visited.add(value)
+
+  if (isHistoryItemArray(value))
+    return value
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const nestedItems = extractHistoryItemsFromResponse(entry, visited)
+      if (nestedItems.length)
+        return nestedItems
+    }
+    return []
+  }
+
+  const priorityKeys = ['items', 'data', 'result']
+  for (const key of priorityKeys) {
+    if (!Object.prototype.hasOwnProperty.call(value, key))
+      continue
+    const nestedItems = extractHistoryItemsFromResponse(value[key], visited)
+    if (nestedItems.length)
+      return nestedItems
+  }
+
+  for (const nestedValue of Object.values(value)) {
+    const nestedItems = extractHistoryItemsFromResponse(nestedValue, visited)
+    if (nestedItems.length)
+      return nestedItems
+  }
+
+  return []
+}
+
+const historyPreviewItems = computed(() => {
+  return (state.historyItems || []).filter((item) => {
+    const historyDoc = getHistorySnapshotDoc(item)
+    if (!historyDoc)
+      return false
+    return !blockDocsMatchForDiff(historyDoc, currentBlock.value)
+  })
+})
+
+const selectedHistoryEntry = computed(() => {
+  return historyPreviewItems.value.find(item => item.historyId === state.historySelectedId) || null
+})
+
+const historyVersionItems = computed(() => {
+  return historyPreviewItems.value.map((item, index) => ({
+    name: item.historyId,
+    title: formatHistoryEntryLabel(item, index),
+  }))
+})
+
+const syncHistoryPreviewBlock = (entry) => {
+  state.historyPreviewBlock = buildHistoryPreviewBlock(getHistorySnapshotDoc(entry))
+}
+
+watch(selectedHistoryEntry, (entry) => {
+  syncHistoryPreviewBlock(entry)
+}, { immediate: false })
+
+const summarizeBlockChangeValue = (value) => {
+  if (value == null || value === '')
+    return '—'
+  if (typeof value === 'boolean')
+    return value ? 'Yes' : 'No'
+  if (Array.isArray(value))
+    return value.length ? value.map(item => String(item || '').trim()).filter(Boolean).join(', ') : '—'
+  if (typeof value === 'object') {
+    try {
+      const stringValue = JSON.stringify(value, null, 2)
+      return stringValue.length > 600 ? `${stringValue.slice(0, 600)}...` : stringValue
+    }
+    catch {
+      return '—'
+    }
+  }
+  const stringValue = String(value).trim()
+  return stringValue.length > 600 ? `${stringValue.slice(0, 600)}...` : stringValue
+}
+
+const escapeDiffHtml = (value) => {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+const tokenizeDiffValue = (value) => {
+  return String(value ?? '').match(/([A-Za-z0-9._:-]+|\s+|.)/g) || []
+}
+
+const buildHighlightedDiffHtml = (sourceValue, compareValue) => {
+  const sourceTokens = tokenizeDiffValue(sourceValue)
+  const compareTokens = tokenizeDiffValue(compareValue)
+  const sourceCount = sourceTokens.length
+  const compareCount = compareTokens.length
+
+  if (!sourceCount)
+    return ''
+
+  if ((sourceCount * compareCount) > 120000) {
+    const escaped = escapeDiffHtml(sourceValue)
+    return escaped
+      ? `<span class="rounded bg-yellow-200 px-0.5 text-slate-950 dark:bg-yellow-400/40 dark:text-yellow-50">${escaped}</span>`
+      : '—'
+  }
+
+  const lcs = Array.from({ length: sourceCount + 1 }, () => Array(compareCount + 1).fill(0))
+
+  for (let i = sourceCount - 1; i >= 0; i--) {
+    for (let j = compareCount - 1; j >= 0; j--) {
+      if (sourceTokens[i] === compareTokens[j])
+        lcs[i][j] = lcs[i + 1][j + 1] + 1
+      else
+        lcs[i][j] = Math.max(lcs[i + 1][j], lcs[i][j + 1])
+    }
+  }
+
+  const changedIndexes = new Set()
+  let i = 0
+  let j = 0
+
+  while (i < sourceCount && j < compareCount) {
+    if (sourceTokens[i] === compareTokens[j]) {
+      i++
+      j++
+      continue
+    }
+
+    if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+      changedIndexes.add(i)
+      i++
+      continue
+    }
+
+    j++
+  }
+
+  while (i < sourceCount) {
+    changedIndexes.add(i)
+    i++
+  }
+
+  let html = ''
+  let pendingChanged = ''
+
+  const flushPendingChanged = () => {
+    if (!pendingChanged)
+      return
+    html += `<span class="rounded bg-yellow-200 px-0.5 text-slate-950 dark:bg-yellow-400/40 dark:text-yellow-50">${pendingChanged}</span>`
+    pendingChanged = ''
+  }
+
+  sourceTokens.forEach((token, index) => {
+    const escapedToken = escapeDiffHtml(token)
+    if (changedIndexes.has(index)) {
+      pendingChanged += escapedToken
+      return
+    }
+    flushPendingChanged()
+    html += escapedToken
+  })
+
+  flushPendingChanged()
+  return html || '—'
+}
+
+const buildBlockChangeDetails = (baseDoc, compareDoc, { baseLabel, compareLabel } = {}) => {
+  const changes = []
+  const base = baseDoc || {}
+  const compare = compareDoc || {}
+  const fields = [
+    { key: 'name', label: 'Block Name' },
+    { key: 'tags', label: 'Tags' },
+    { key: 'type', label: 'Block Type', transform: value => normalizeBlockTypes(value, { fallbackToPage: false }) },
+    { key: 'themes', label: 'Allowed Themes' },
+    { key: 'synced', label: 'Synced Block' },
+    { key: 'previewType', label: 'Preview Surface', transform: value => normalizePreviewType(value) },
+    { key: 'content', label: 'Block Content' },
+  ]
+
+  fields.forEach((field) => {
+    const baseValue = field.transform ? field.transform(base?.[field.key]) : base?.[field.key]
+    const compareValue = field.transform ? field.transform(compare?.[field.key]) : compare?.[field.key]
+    if (areEqualNormalized(baseValue, compareValue))
+      return
+    changes.push({
+      key: field.key,
+      label: field.label,
+      baseLabel,
+      compareLabel,
+      base: summarizeBlockChangeValue(baseValue),
+      compare: summarizeBlockChangeValue(compareValue),
+      baseHtml: buildHighlightedDiffHtml(baseValue, compareValue),
+      compareHtml: buildHighlightedDiffHtml(compareValue, baseValue),
+    })
+  })
+
+  return changes
+}
+
+const historyDiffDetails = computed(() => {
+  return buildBlockChangeDetails(getHistorySnapshotDoc(selectedHistoryEntry.value), currentBlock.value, {
+    baseLabel: 'Selected History',
+    compareLabel: 'Current',
+  })
+})
+
+const historyDiffBasePreviewBlock = computed(() => {
+  return buildHistoryPreviewBlock(getHistorySnapshotDoc(selectedHistoryEntry.value))
+})
+
+const historyDiffComparePreviewBlock = computed(() => {
+  return buildHistoryPreviewBlock(currentBlock.value)
+})
+
+const historyDiffCountLabel = computed(() => {
+  if (!selectedHistoryEntry.value)
+    return 'Select an entry'
+  const count = historyDiffDetails.value.length
+  if (count === 0)
+    return 'No differences'
+  if (count === 1)
+    return '1 difference'
+  return `${count} differences`
+})
+
+const hasHistoryDiff = computed(() => historyDiffDetails.value.length > 0)
+
+watch(hasHistoryDiff, (nextValue) => {
+  if (!nextValue)
+    state.showHistoryDiffDialog = false
+})
+
+const loadBlockHistory = async () => {
+  if (!edgeFirebase?.user?.uid || !currentBlockPath.value)
+    return
+
+  state.historyLoading = true
+  state.historyError = ''
+  try {
+    const response = await edgeFirebase.runFunction('history-listHistory', {
+      uid: edgeFirebase.user.uid,
+      path: currentBlockPath.value,
+      limit: 50,
+    })
+
+    state.historyItems = extractHistoryItemsFromResponse(response)
+    const nextSelectedId = historyPreviewItems.value.find(item => item.historyId === state.historySelectedId)?.historyId
+      || historyPreviewItems.value[0]?.historyId
+      || ''
+    state.historySelectedId = nextSelectedId
+    syncHistoryPreviewBlock(selectedHistoryEntry.value)
+  }
+  catch (error) {
+    console.error('Failed to load block history', error)
+    state.historyItems = []
+    state.historySelectedId = ''
+    state.historyPreviewBlock = null
+    state.historyError = 'Failed to load block history.'
+  }
+  finally {
+    state.historyLoading = false
+  }
+}
+
+const openHistoryDialog = async () => {
+  if (!currentBlock.value || !currentBlockPath.value || !edgeFirebase?.user?.uid)
+    return
+  state.historySelectedId = ''
+  state.historyDialogOpen = true
+  await loadBlockHistory()
+}
+
+const closeHistoryDialog = () => {
+  if (state.historyRestoring)
+    return
+  state.showHistoryDiffDialog = false
+  state.historyDialogOpen = false
+}
+
+const restoreHistoryVersion = async () => {
+  const historyEntry = selectedHistoryEntry.value
+  if (!historyEntry?.historyId || !edgeFirebase?.user?.uid)
+    return
+
+  state.historyRestoring = true
+  state.historyError = ''
+  try {
+    const targetState = getHistorySnapshotState(historyEntry)
+    await edgeFirebase.runFunction('history-restoreHistory', {
+      uid: edgeFirebase.user.uid,
+      historyId: historyEntry.historyId,
+      targetState,
+    })
+    syncEditorStateFromBlockDoc(getHistorySnapshotDoc(historyEntry))
+    state.showHistoryDiffDialog = false
+    state.historyDialogOpen = false
+    state.editorKey += 1
+    notifySuccess(`Restored block from ${formatHistoryEntryLabel(historyEntry)}.`)
+  }
+  catch (error) {
+    console.error('Failed to restore block history', error)
+    state.historyError = 'Failed to restore this version.'
+    notifyError('Failed to restore block history.')
+  }
+  finally {
+    state.historyRestoring = false
+  }
+}
+
+const handleUnsavedChanges = (changes) => {
+  state.editorHasUnsavedChanges = changes === true
+}
+
+const exportCurrentBlock = async () => {
   const doc = blocks.value?.[props.blockId]
   if (!doc || !doc.docId) {
     notifyError('Save this block before exporting.')
     return
   }
   const exportPayload = { ...getBlockDocDefaults(), ...doc }
-  downloadJsonFile(exportPayload, `block-${doc.docId}.json`)
-  notifySuccess(`Exported block "${doc.docId}".`)
+  const saved = await saveJsonFile(exportPayload, `block-${doc.docId}.json`)
+  if (saved)
+    notifySuccess(`Exported block "${doc.docId}".`)
 }
 </script>
 
@@ -714,17 +1333,19 @@ const exportCurrentBlock = () => {
     v-if="edgeGlobal.edgeState.organizationDocPath && state.mounted"
   >
     <edge-editor
+      :key="state.editorKey"
       collection="blocks"
       :doc-id="props.blockId"
       :schema="blockSchema"
       :new-doc-schema="state.newDocs.blocks"
-      header-class="py-2 bg-secondary text-foreground rounded-none sticky top-0 border"
+      header-class="py-2 rounded-none sticky top-0 border-b border-slate-300 bg-slate-100 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
       class="w-full mx-auto flex-1 bg-transparent flex flex-col border-none shadow-none pt-0 px-0"
-      card-content-class="px-0"
+      card-content-class="px-0 pb-0"
       :show-footer="false"
       :no-close-after-save="true"
       :working-doc-overrides="state.workingDoc"
       @working-doc="editorDocUpdates"
+      @unsaved-changes="handleUnsavedChanges"
     >
       <template #header-start="slotProps">
         <FilePenLine class="mr-2" />
@@ -769,6 +1390,18 @@ const exportCurrentBlock = () => {
               size="icon"
               variant="outline"
               class="h-9 w-9"
+              :disabled="props.blockId === 'new' || !currentBlock"
+              title="View Block History"
+              aria-label="View Block History"
+              @click="openHistoryDialog"
+            >
+              <History class="h-4 w-4" />
+            </edge-shad-button>
+            <edge-shad-button
+              type="button"
+              size="icon"
+              variant="outline"
+              class="h-9 w-9"
               :disabled="props.blockId === 'new' || !blocks?.[props.blockId]"
               title="Export Block"
               aria-label="Export Block"
@@ -802,6 +1435,19 @@ const exportCurrentBlock = () => {
               />
             </div>
             <div class="flex-auto">
+              <edge-shad-select-tags
+                v-model="slotProps.workingDoc.type"
+                label="Block Type"
+                name="type"
+                :items="blockTypeOptions"
+                item-title="title"
+                item-value="name"
+                :allow-additions="false"
+                placeholder="Block Type"
+                class="w-full max-w-[800px] mx-auto mb-5 text-black"
+              />
+            </div>
+            <div class="flex-auto">
               <edge-shad-select
                 v-model="slotProps.workingDoc.themes"
                 label="Allowed Themes"
@@ -812,13 +1458,14 @@ const exportCurrentBlock = () => {
                 class="flex-auto"
               />
             </div>
-            <div class="flex-auto pt-2">
+            <div class="flex-auto pt-2 text-slate-900 dark:text-slate-100">
               <edge-shad-checkbox
                 v-model="slotProps.workingDoc.synced"
                 name="synced"
                 label="Synced Block"
+                class="border-slate-400 bg-white text-slate-900 data-[state=checked]:bg-slate-700 data-[state=checked]:text-white dark:border-slate-500 dark:bg-slate-800 dark:text-slate-100 dark:data-[state=checked]:bg-slate-200 dark:data-[state=checked]:text-slate-900"
               >
-                Synced Block
+                <span class="text-slate-900">Synced Block</span>
               </edge-shad-checkbox>
             </div>
           </div>
@@ -831,8 +1478,8 @@ const exportCurrentBlock = () => {
                 language="handlebars"
                 name="content"
                 :enable-formatting="false"
-                height="calc(100vh - 300px)"
-                class="mb-4 flex-1"
+                height="calc(100vh - 316px)"
+                class="mb-0 flex-1"
                 @line-click="payload => handleEditorLineClick(payload, slotProps.workingDoc)"
               >
                 <template #end-actions>
@@ -841,8 +1488,8 @@ const exportCurrentBlock = () => {
                       <edge-shad-button
                         type="button"
                         size="sm"
-                        variant="outline"
-                        class="h-8 px-2 text-[11px] uppercase tracking-wide"
+                        variant="ghost"
+                        class="h-8 px-3 text-[11px] uppercase tracking-wide rounded border border-slate-300 bg-white text-slate-900 dark:border-slate-700 dark:bg-slate-900/70 dark:text-slate-100"
                       >
                         Dynamic Content
                       </edge-shad-button>
@@ -862,8 +1509,8 @@ const exportCurrentBlock = () => {
                   <edge-shad-button
                     type="button"
                     size="sm"
-                    variant="secondary"
-                    class="h-8 px-2 text-[11px] uppercase tracking-wide gap-2"
+                    variant="ghost"
+                    class="h-8 px-3 text-[11px] uppercase tracking-wide rounded border border-slate-300 bg-slate-900 text-white dark:border-slate-700 dark:bg-slate-200 dark:text-slate-900 gap-2"
                     @click="state.helpOpen = true"
                   >
                     <HelpCircle class="w-4 h-4" />
@@ -873,17 +1520,24 @@ const exportCurrentBlock = () => {
               </edge-cms-code-editor>
             </div>
             <div class="w-1/2 space-y-2">
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between gap-2">
                 <span class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Viewport</span>
-                <div class="flex items-center gap-1">
+                <div class="flex shrink-0 items-center gap-1 flex-nowrap">
+                  <edge-shad-select
+                    v-model="state.previewScale"
+                    :items="previewScaleOptions"
+                    placeholder="%"
+                    class="w-[84px] shrink-0"
+                    trigger-class="!h-7 min-h-7 px-2 py-1 text-xs"
+                  />
                   <edge-shad-button
                     v-for="option in previewViewportOptions"
                     :key="option.id"
                     type="button"
                     size="icon"
                     variant="ghost"
-                    class="h-[28px] w-[28px] text-xs border transition-colors"
-                    :class="state.previewViewport === option.id ? 'bg-primary text-primary-foreground border-primary shadow-sm' : 'bg-muted text-foreground border-border hover:bg-muted/80'"
+                    class="h-[28px] w-[28px] shrink-0 text-xs border transition-colors"
+                    :class="state.previewViewport === option.id ? 'bg-slate-700 text-white border-slate-700 shadow-sm dark:bg-slate-200 dark:text-slate-900 dark:border-slate-200' : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-200 dark:border-slate-700 dark:hover:bg-slate-800'"
                     @click="setPreviewViewport(option.id)"
                   >
                     <component :is="option.icon" class="w-3.5 h-3.5" />
@@ -892,19 +1546,23 @@ const exportCurrentBlock = () => {
               </div>
               <div
                 class="w-full mx-auto rounded-none overflow-visible"
-                :style="previewViewportStyle"
+                :style="previewViewportContainStyle"
               >
-                <div class="relative overflow-visible rounded-none" :class="[previewSurfaceClass, previewCanvasClass]" style="transform: translateZ(0);">
+                <div class="w-full mx-auto bg-white drop-shadow-[4px_4px_6px_rgba(0,0,0,0.5)] shadow-lg shadow-black/30" :class="previewSurfaceClass" style="transform: translateZ(0);">
                   <edge-cms-block
                     v-if="state.previewBlock"
                     :key="previewThemeRenderKey"
                     v-model="state.previewBlock"
+                    class="!h-[calc(100vh-300px)] overflow-y-auto"
                     :site-id="edgeGlobal.edgeState.blockEditorSite"
+                    :render-context="state.previewRenderContext"
                     :theme="theme"
                     :edit-mode="true"
                     :contain-fixed="true"
                     :disable-interactive-preview-in-edit="false"
+                    :suppress-interactive-clicks-except-allowed="true"
                     :allow-delete="false"
+                    :standalone-preview="true"
                     :viewport-mode="previewViewportMode"
                     :block-id="state.previewBlock.id"
                     @delete="ignorePreviewDelete"
@@ -916,6 +1574,222 @@ const exportCurrentBlock = () => {
         </div>
       </template>
     </edge-editor>
+    <edge-shad-dialog v-model="state.historyDialogOpen">
+      <DialogContent class="max-w-[96vw] max-h-[92vh] overflow-hidden flex flex-col">
+        <DialogHeader>
+          <DialogTitle class="text-left">
+            Block History
+          </DialogTitle>
+          <DialogDescription class="text-left">
+            Select a saved version, preview it, and restore it if needed.
+          </DialogDescription>
+        </DialogHeader>
+        <div class="min-w-0 space-y-4">
+          <div class="grid gap-4 md:grid-cols-[minmax(0,320px)_1fr] md:items-end">
+            <div class="flex min-w-0 flex-col justify-end">
+              <edge-shad-combobox
+                v-model="state.historySelectedId"
+                name="blockHistoryVersion"
+                label="History Entry"
+                :items="historyVersionItems"
+                placeholder="Select a history entry"
+                class="w-full"
+                :disabled="state.historyLoading || state.historyRestoring || historyVersionItems.length === 0"
+              />
+            </div>
+            <div class="mb-2 flex min-w-0 flex-col justify-end">
+              <edge-shad-button
+                v-if="hasHistoryDiff"
+                type="button"
+                variant="outline"
+                class="h-10 justify-between gap-3 px-3 text-left"
+                :disabled="!selectedHistoryEntry || state.historyLoading"
+                @click="state.showHistoryDiffDialog = true"
+              >
+                <span class="truncate">View Diff</span>
+                <span class="shrink-0 text-xs text-slate-500 dark:text-slate-400">
+                  {{ historyDiffCountLabel }}
+                </span>
+              </edge-shad-button>
+              <div
+                v-else-if="!selectedHistoryEntry && !state.historyLoading"
+                class="rounded-md border border-slate-300/70 bg-slate-50 mb-1 px-3 py-2 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-900/70 dark:text-slate-300"
+              >
+                No older saved versions differ from the current block.
+              </div>
+            </div>
+          </div>
+
+          <div v-if="state.historyError" class="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
+            {{ state.historyError }}
+          </div>
+
+          <div
+            v-if="state.editorHasUnsavedChanges"
+            class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
+          >
+            There are unsaved changes. History compares saved versions of this block.
+          </div>
+
+          <div class="min-w-0 rounded-md border border-slate-300 bg-card dark:border-slate-700">
+            <div
+              v-if="state.historyLoading"
+              class="flex h-[70vh] items-center justify-center gap-2 text-sm text-slate-500 dark:text-slate-400"
+            >
+              <Loader2 class="h-4 w-4 animate-spin" />
+              Loading history preview...
+            </div>
+            <div
+              v-else-if="!state.historyPreviewBlock"
+              class="flex h-[70vh] items-center justify-center px-6 text-center text-sm text-slate-500 dark:text-slate-400"
+            >
+              No older saved versions are available to preview.
+            </div>
+            <div
+              v-else
+              class="w-full mx-auto rounded-none overflow-visible"
+              :style="previewViewportContainStyle"
+            >
+              <div class="w-full mx-auto bg-white drop-shadow-[4px_4px_6px_rgba(0,0,0,0.5)] shadow-lg shadow-black/30" :class="previewSurfaceClass" style="transform: translateZ(0);">
+                <edge-cms-block
+                  v-model="state.historyPreviewBlock"
+                  class="!h-[70vh] overflow-y-auto"
+                  :site-id="edgeGlobal.edgeState.blockEditorSite"
+                  :render-context="state.previewRenderContext"
+                  :theme="theme"
+                  :edit-mode="false"
+                  :contain-fixed="true"
+                  :disable-interactive-preview-in-edit="false"
+                  :suppress-interactive-clicks-except-allowed="true"
+                  :allow-delete="false"
+                  :standalone-preview="true"
+                  :viewport-mode="previewViewportMode"
+                  :block-id="state.historyPreviewBlock.id"
+                  @delete="ignorePreviewDelete"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+        <DialogFooter class="pt-2 flex justify-between">
+          <edge-shad-button variant="outline" :disabled="state.historyRestoring" @click="closeHistoryDialog">
+            Cancel
+          </edge-shad-button>
+          <edge-shad-button
+            :disabled="state.historyLoading || state.historyRestoring || !selectedHistoryEntry"
+            @click="restoreHistoryVersion"
+          >
+            <Loader2 v-if="state.historyRestoring" class="mr-2 h-4 w-4 animate-spin" />
+            <RotateCcw v-else class="mr-2 h-4 w-4" />
+            Restore
+          </edge-shad-button>
+        </DialogFooter>
+      </DialogContent>
+    </edge-shad-dialog>
+    <edge-shad-dialog v-model="state.showHistoryDiffDialog">
+      <DialogContent class="max-w-[96vw] max-h-[92vh] overflow-hidden flex flex-col">
+        <DialogHeader>
+          <DialogTitle class="text-left">
+            History Diff
+          </DialogTitle>
+          <DialogDescription class="text-left">
+            Review differences between the selected history entry and the current block.
+          </DialogDescription>
+        </DialogHeader>
+        <div class="mt-2 flex-1 overflow-y-auto pr-1">
+          <div v-if="historyDiffDetails.length" class="space-y-3">
+            <div
+              v-for="change in historyDiffDetails"
+              :key="change.key"
+              class="rounded-md border border-slate-300 dark:border-slate-700 bg-slate-200 dark:bg-slate-800 p-3 text-left"
+            >
+              <div class="text-sm font-semibold text-slate-900 dark:text-slate-100 mb-2">
+                {{ change.label }}
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
+                <div class="rounded border border-gray-200 dark:border-white/15 bg-white/80 dark:bg-gray-800 p-2">
+                  <div class="text-[11px] uppercase tracking-wide text-gray-500 mb-1">
+                    {{ change.baseLabel || 'Selected History' }}
+                  </div>
+                  <div
+                    class="whitespace-pre-wrap break-words text-gray-900 dark:text-gray-100"
+                    :class="change.key === 'content' ? 'font-mono text-xs leading-5' : ''"
+                    v-html="change.baseHtml || change.base"
+                  />
+                  <div
+                    v-if="change.key === 'content' && historyDiffBasePreviewBlock"
+                    class="mt-3 rounded-md border border-slate-300 bg-slate-100 p-2 dark:border-slate-700 dark:bg-slate-900/60"
+                  >
+                    <div
+                      class="w-full mx-auto overflow-hidden drop-shadow-[4px_4px_6px_rgba(0,0,0,0.5)] shadow-lg shadow-black/30"
+                      :class="getPreviewSurfaceClass(historyDiffBasePreviewBlock)"
+                      :style="previewViewportContainStyle"
+                    >
+                      <edge-cms-block
+                        :model-value="historyDiffBasePreviewBlock"
+                        class="max-h-[32vh] overflow-y-auto"
+                        :site-id="edgeGlobal.edgeState.blockEditorSite"
+                        :render-context="state.previewRenderContext"
+                        :theme="theme"
+                        :edit-mode="false"
+                        :contain-fixed="true"
+                        :disable-interactive-preview-in-edit="false"
+                        :suppress-interactive-clicks-except-allowed="true"
+                        :allow-delete="false"
+                        :viewport-mode="previewViewportMode"
+                        :block-id="historyDiffBasePreviewBlock.id"
+                        @delete="ignorePreviewDelete"
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div class="rounded border border-gray-200 dark:border-white/15 bg-white/80 dark:bg-gray-800 p-2">
+                  <div class="text-[11px] uppercase tracking-wide text-gray-500 mb-1">
+                    {{ change.compareLabel || 'Current' }}
+                  </div>
+                  <div
+                    class="whitespace-pre-wrap break-words text-gray-900 dark:text-gray-100"
+                    :class="change.key === 'content' ? 'font-mono text-xs leading-5' : ''"
+                    v-html="change.compareHtml || change.compare"
+                  />
+                  <div
+                    v-if="change.key === 'content' && historyDiffComparePreviewBlock"
+                    class="mt-3 rounded-md border border-slate-300 bg-slate-100 p-2 dark:border-slate-700 dark:bg-slate-900/60"
+                  >
+                    <div
+                      class="w-full mx-auto overflow-hidden drop-shadow-[4px_4px_6px_rgba(0,0,0,0.5)] shadow-lg shadow-black/30"
+                      :class="getPreviewSurfaceClass(historyDiffComparePreviewBlock)"
+                      :style="previewViewportContainStyle"
+                    >
+                      <edge-cms-block
+                        :model-value="historyDiffComparePreviewBlock"
+                        class="max-h-[32vh] overflow-y-auto"
+                        :site-id="edgeGlobal.edgeState.blockEditorSite"
+                        :render-context="state.previewRenderContext"
+                        :theme="theme"
+                        :edit-mode="false"
+                        :contain-fixed="true"
+                        :disable-interactive-preview-in-edit="false"
+                        :suppress-interactive-clicks-except-allowed="true"
+                        :allow-delete="false"
+                        :viewport-mode="previewViewportMode"
+                        :block-id="historyDiffComparePreviewBlock.id"
+                        @delete="ignorePreviewDelete"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <DialogFooter class="pt-4">
+          <edge-shad-button class="w-full" variant="outline" @click="state.showHistoryDiffDialog = false">
+            Close
+          </edge-shad-button>
+        </DialogFooter>
+      </DialogContent>
+    </edge-shad-dialog>
     <Sheet v-model:open="state.helpOpen">
       <SheetContent side="right" class="w-full md:w-1/2 max-w-none sm:max-w-none max-w-2xl">
         <SheetHeader>
@@ -928,20 +1802,23 @@ const exportCurrentBlock = () => {
         </SheetHeader>
         <div class="px-6 pb-6">
           <Tabs class="w-full" default-value="guide">
-            <TabsList class="w-full mt-3 bg-secondary rounded-sm grid grid-cols-5">
-              <TabsTrigger value="guide" class="w-full text-black data-[state=active]:bg-black data-[state=active]:text-white">
+            <TabsList class="w-full mt-3 rounded-sm grid grid-cols-6 border border-slate-300 bg-slate-200 dark:border-slate-700 dark:bg-slate-800">
+              <TabsTrigger value="guide" class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900">
                 Block Guide
               </TabsTrigger>
-              <TabsTrigger value="carousel" class="w-full text-black data-[state=active]:bg-black data-[state=active]:text-white">
-                Carousel Usage
+              <TabsTrigger value="arrays" class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900">
+                Arrays
               </TabsTrigger>
-              <TabsTrigger value="form-helpers" class="w-full text-black data-[state=active]:bg-black data-[state=active]:text-white">
-                Form Helpers
+              <TabsTrigger value="carousel" class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900">
+                Carousels
               </TabsTrigger>
-              <TabsTrigger value="nav-bar" class="w-full text-black data-[state=active]:bg-black data-[state=active]:text-white">
-                Nav Bar
+              <TabsTrigger value="form-helpers" class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900">
+                Forms
               </TabsTrigger>
-              <TabsTrigger value="scroll-reveals" class="w-full text-black data-[state=active]:bg-black data-[state=active]:text-white">
+              <TabsTrigger value="nav-bar" class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900">
+                Nav
+              </TabsTrigger>
+              <TabsTrigger value="scroll-reveals" class="w-full text-slate-700 dark:text-slate-200 data-[state=active]:bg-slate-700 data-[state=active]:text-white dark:data-[state=active]:bg-slate-200 dark:data-[state=active]:text-slate-900">
                 Scroll Reveals
               </TabsTrigger>
             </TabsList>
@@ -962,13 +1839,6 @@ const exportCurrentBlock = () => {
                       <a href="#input-types" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Inputs</a>
                       <a href="#image-fields" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Images</a>
                       <a href="#select-options" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Selects</a>
-                      <a href="#arrays-manual" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Arrays</a>
-                      <a href="#arrays-firestore" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Firestore</a>
-                      <a href="#arrays-api" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">API</a>
-                      <a href="#arrays-filters" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Filters</a>
-                      <a href="#conditionals" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Conditionals</a>
-                      <a href="#subarrays" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Subarrays</a>
-                      <a href="#entries" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Entries</a>
                       <a href="#rendering-rules" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Rendering</a>
                       <a href="#loading-tokens" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Loading</a>
                       <a href="#validation" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Validation</a>
@@ -1108,174 +1978,6 @@ const exportCurrentBlock = () => {
                     </div>
                   </section>
 
-                  <section id="arrays-manual" class="space-y-3">
-                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                      Arrays (Manual Lists)
-                    </h3>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {"field":"list","value":[]}}}}
-  {{item}}
-{{{/array}}}</code></pre>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
-  "field":"cards",
-  "schema":[
-    {"field":"title","type":"text"},
-    {"field":"body","type":"richtext"},
-    {"field":"image","type":"image"}
-  ],
-  "value":[]
-}}}}
-  <h3>{{item.title}}</h3>
-  <div>{{item.body}}</div>
-  <img :src="item.image">
-{{{/array}}}</code></pre>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
-  "field":"statics",
-  "value":[
-    "First item",
-    "Second item",
-    "Third item"
-  ]
-}}}}
-  <li>{{item}}</li>
-{{{/array}}}</code></pre>
-                    <p class="text-sm text-foreground">
-                      Use <code>schema</code> to define fields on each array item.
-                      Supported item UI types: <code>text</code>, <code>textarea</code>, <code>richtext</code>, <code>image</code>, <code>number</code>, <code>option</code>.
-                    </p>
-                    <div class="text-sm text-foreground space-y-1">
-                      <div>Manual arrays show an “Add Entry” form, drag handles to reorder, and delete buttons.</div>
-                      <div>Use <code>number</code> for numeric input. <code>integer</code>/<code>money</code> only affect display formatting.</div>
-                      <div><code>limit</code> trims output to the first N items when rendering.</div>
-                    </div>
-                    <p class="text-sm text-foreground">
-                      Inside an array block you render <code v-pre>{{item}}</code> or <code v-pre>{{item.fieldName}}</code>.
-                    </p>
-                    <p class="text-sm text-foreground">
-                      For schema formatting only, you can also use <code>integer</code> or <code>money</code> types.
-                    </p>
-                  </section>
-
-                  <section id="arrays-firestore" class="space-y-3">
-                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                      Arrays from Firestore
-                    </h3>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
-  "field":"list",
-  "schema":[{"field":"name","type":"text"},{"field":"role","type":"text"}],
-  "collection":{
-    "path":"team",
-    "uniqueKey":"{orgId}",
-    "query":[{"field":"active","operator":"==","value":true}],
-    "order":[{"field":"name","direction":"asc"}]
-  },
-  "limit":6,
-  "value":[]
-}}}}</code></pre>
-                    <div class="text-sm text-foreground space-y-1">
-                      <div><code>path</code> is under <code>organizations/{orgId}</code>.</div>
-                      <div><code>uniqueKey</code> supports <code>{orgId}</code> and <code>{siteId}</code>.</div>
-                      <div><code>query</code> and <code>order</code> map to Firestore filters and sort.</div>
-                      <div><code>limit</code> caps the results.</div>
-                    </div>
-                  </section>
-
-                  <section id="arrays-api" class="space-y-3">
-                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                      Arrays from an API
-                    </h3>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
-  "field":"list",
-  "api":"https://api.example.com/items",
-  "apiField":"data",
-  "apiQuery":"?limit=4",
-  "limit":4,
-  "value":[]
-}}}}</code></pre>
-                    <div class="text-sm text-foreground space-y-1">
-                      <div><code>api</code> is the base URL without query string.</div>
-                      <div><code>apiQuery</code> is appended to the URL.</div>
-                      <div><code>apiField</code> is the array field in the response.</div>
-                    </div>
-                    <p class="text-sm text-foreground">
-                      Filters from <code>queryOptions</code> become query string parameters at runtime.
-                    </p>
-                  </section>
-
-                  <section id="arrays-filters" class="space-y-3">
-                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                      Filters for Arrays (queryOptions)
-                    </h3>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>"queryOptions":[
-  {
-    "field":"users",
-    "operator":"array-contains-any",
-    "options":"users",
-    "optionsKey":"name",
-    "optionsValue":"userId",
-    "multiple":true
-  }
-]</code></pre>
-                    <div class="text-sm text-foreground space-y-1">
-                      <div><code>queryOptions</code> creates filter inputs for CMS users.</div>
-                      <div>Selections are stored in <code>meta.queryItems</code> and used in the API/collection query.</div>
-                      <div><code>options</code> can be a collection name or static array.</div>
-                      <div><code>multiple: true</code> saves an array.</div>
-                    </div>
-                  </section>
-
-                  <section id="conditionals" class="space-y-3">
-                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                      Conditionals (Inside Arrays)
-                    </h3>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#if {"cond":"item.price > 0"} }}}
-  <div>Price: {{item.price}}</div>
-{{{#else}}}
-  <div>Contact for pricing</div>
-{{{/if}}}</code></pre>
-                    <div class="text-sm text-foreground space-y-1">
-                      <div><code>cond</code> works on <code>item.*</code> inside array/subarray templates.</div>
-                      <div>Supported operators: <code>==</code>, <code>!=</code>, <code>&gt;</code>, <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>.</div>
-                    </div>
-                  </section>
-
-                  <section id="subarrays" class="space-y-3">
-                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                      Subarrays (Nested Lists)
-                    </h3>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {"field":"items","value":[],"as":"card"}}}}
-  <h3>{{card.title}}</h3>
-  {{{#subarray:child {"field":"item.children","limit":0 }}}}
-    <div>{{child}}</div>
-  {{{/subarray}}}
-{{{/array}}}</code></pre>
-                    <p class="text-sm text-foreground">
-                      Use <code>as</code> to set an alias (like <code v-pre>{{card.title}}</code>). Use <code>subarray</code> to loop nested lists.
-                    </p>
-                  </section>
-
-                  <section id="entries" class="space-y-3">
-                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                      Entries (Object Key/Value Loops)
-                    </h3>
-                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#entries:pair {"field":"settings","value":{"theme":"dark","ctaText":"Contact Us"}}}}}
-  <div><strong>{{pair.key}}</strong>: {{pair.value}}</div>
-{{{/entries}}}
-
-{{{#entries:group {"field":"groupedItems","value":{"featured":["One","Two"],"archive":["Three"]}}}}}
-  <h4>{{group.key}}</h4>
-  {{{#subarray:child {"field":"item.value","value":[]}}}}
-    <div>{{child}}</div>
-  {{{/subarray}}}
-{{{/entries}}}</code></pre>
-                    <div class="text-sm text-foreground space-y-1">
-                      <div><code>entries</code> loops object fields instead of arrays.</div>
-                      <div>Use it at the root or inside other loops; it does not need to be inside <code>subarray</code>.</div>
-                      <div>Each iteration exposes <code>item.key</code> and <code>item.value</code>, plus alias access like <code v-pre>{{pair.key}}</code>.</div>
-                      <div>If a value is an array, use nested <code>subarray</code> on <code>item.value</code>.</div>
-                      <div>If <code>field</code> is not an object, it renders nothing.</div>
-                    </div>
-                  </section>
-
                   <section id="rendering-rules" class="space-y-2">
                     <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                       Rendering Rules
@@ -1283,8 +1985,71 @@ const exportCurrentBlock = () => {
                     <div class="text-sm text-foreground space-y-1">
                       <div><code>text</code> and <code>textarea</code> output is HTML‑escaped.</div>
                       <div><code>richtext</code> output is inserted as HTML.</div>
-                      <div>Array schema types format output (e.g. <code>money</code> formats USD, <code>integer</code> truncates).</div>
+                      <div>Inline formatter output is HTML‑escaped by default (same safety behavior as normal text placeholders).</div>
                     </div>
+                  </section>
+
+                  <section id="inline-formatters" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Inline Formatters
+                    </h3>
+                    <p class="text-sm text-foreground">
+                      You can now format values directly where they are used:
+                    </p>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{ date(post.publishDate) }}
+{{ datetime(post.publishDate, "short") }}
+{{ money(post.budget) }}
+{{ lower(menuItem.menuTitle) }}
+{{ trim(site.tagline) }}
+{{ slug(post.title) }}
+{{ title(post.slug) }}
+{{ default(post.summary, "Summary coming soon") }}</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div>Supported formatter names: <code>date(value, options?)</code>, <code>datetime(value, options?)</code>, <code>money(value, options?)</code>, <code>lower(value)</code>, <code>upper(value)</code>, <code>trim(value)</code>, <code>slug(value)</code>, <code>title(value)</code>, <code>deslug(value)</code>, <code>default(value, fallback)</code>.</div>
+                      <div>Existing schema/meta formatting (<code>number</code>, <code>money</code>, <code>richtext</code>, etc.) still works unchanged.</div>
+                      <div>Inline formatter output is HTML-escaped by default (same safety behavior as normal text placeholders).</div>
+                    </div>
+
+                    <h4 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Basic Examples
+                    </h4>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>&lt;h2&gt;{{ upper(post.title) }}&lt;/h2&gt;
+&lt;p&gt;Published {{ date(post.publishDate, "long") }}&lt;/p&gt;
+&lt;p&gt;Author handle: {{ slug(post.authorName) }}&lt;/p&gt;
+&lt;p&gt;Slug label: {{ title(post.slug) }}&lt;/p&gt;
+&lt;p&gt;Budget: {{ money(post.budget) }}&lt;/p&gt;
+&lt;p&gt;{{ default(post.summary, "No summary available.") }}&lt;/p&gt;</code></pre>
+
+                    <h4 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Complex Examples
+                    </h4>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>&lt;time datetime="{{ post.publishDate }}"&gt;
+  {{ datetime(post.publishDate, {
+    locale: "en-US",
+    dateStyle: "full",
+    timeStyle: "short"
+  }) }}
+&lt;/time&gt;
+
+&lt;p&gt;
+  {{ money(post.budget, {
+    locale: "en-US",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }) }}
+&lt;/p&gt;</code></pre>
+
+                    <h4 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Arrays / Subarrays Example
+                    </h4>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {"field":"events","as":"event"} }}}
+  &lt;article&gt;
+    &lt;h3&gt;{{ trim(event.title) }}&lt;/h3&gt;
+    &lt;p&gt;{{ date(event.startAt, { locale: "en-US", month: "long", day: "numeric", year: "numeric" }) }}&lt;/p&gt;
+    &lt;a href="/events/{{ slug(event.title) }}"&gt;Read more&lt;/a&gt;
+  &lt;/article&gt;
+{{{/array}}}</code></pre>
                   </section>
 
                   <section id="loading-tokens" class="space-y-2">
@@ -1391,6 +2156,291 @@ const exportCurrentBlock = () => {
   indexKeys: ['name', 'city', 'state', 'status'],
   metadataKeys: ['name', 'city', 'state', 'status', 'price', 'doc_created_at'],
 })</code></pre>
+                  </section>
+                </div>
+              </div>
+            </TabsContent>
+
+            <TabsContent value="arrays">
+              <div class="h-[calc(100vh-190px)] overflow-y-auto pr-1 pb-6">
+                <div class="space-y-8">
+                  <div class="rounded-md border border-border/60 bg-muted/30 p-3">
+                    <div class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Quick Menu
+                    </div>
+                    <div class="mt-2 flex flex-wrap gap-2 text-xs">
+                      <a href="#arrays-manual" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Manual Arrays</a>
+                      <a href="#arrays-firestore" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Firestore Arrays</a>
+                      <a href="#arrays-api" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">API Arrays</a>
+                      <a href="#arrays-filters" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Filters</a>
+                      <a href="#arrays-query-flow" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Query Strategy</a>
+                      <a href="#conditionals" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Conditionals</a>
+                      <a href="#subarrays" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Subarrays</a>
+                      <a href="#render-blocks" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Render Blocks</a>
+                      <a href="#entries" class="px-2 py-1 rounded border border-border bg-background hover:bg-muted transition">Entries</a>
+                    </div>
+                  </div>
+
+                  <section id="arrays-manual" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Arrays (Manual Lists)
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {"field":"list","value":[]}}}}
+  {{item}}
+{{{/array}}}</code></pre>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
+  "field":"cards",
+  "schema":[
+    {"field":"title","type":"text"},
+    {"field":"body","type":"richtext"},
+    {"field":"image","type":"image"}
+  ],
+  "value":[]
+}}}}
+  <h3>{{item.title}}</h3>
+  <div>{{item.body}}</div>
+  <img :src="item.image">
+{{{/array}}}</code></pre>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
+  "field":"statics",
+  "value":[
+    "First item",
+    "Second item",
+    "Third item"
+  ]
+}}}}
+  <li>{{item}}</li>
+{{{/array}}}</code></pre>
+                    <p class="text-sm text-foreground">
+                      Use <code>schema</code> when each item needs its own fields.
+                      Supported item inputs are <code>text</code>, <code>textarea</code>, <code>richtext</code>, <code>image</code>, <code>number</code>, and <code>option</code>.
+                    </p>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div>Manual arrays show an Add Entry form, drag handles for sorting, and delete buttons.</div>
+                      <div>Use <code>number</code> for numeric item fields.</div>
+                      <div><code>limit</code> shows only the first N items when the block renders.</div>
+                    </div>
+                    <p class="text-sm text-foreground">
+                      Inside the loop, render <code v-pre>{{item}}</code> for simple values or <code v-pre>{{item.fieldName}}</code> for object fields.
+                    </p>
+                  </section>
+
+                  <section id="arrays-firestore" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Arrays from Firestore
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
+  "field":"list",
+  "schema":[{"field":"name","type":"text"},{"field":"role","type":"text"}],
+  "collection":{
+    "path":"team",
+    "uniqueKey":"{orgId}",
+    "query":[{"field":"active","operator":"==","value":true}],
+    "order":[{"field":"name","direction":"asc"}]
+  },
+  "limit":6,
+  "value":[]
+}}}}</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div><code>path</code> is under <code>organizations/{orgId}</code>.</div>
+                      <div><code>query</code> stays exactly as authored in the saved block. Supported runtime tokens include <code>{orgId}</code>, <code>{siteId}</code>, and <code>{routeLastSegment}</code>.</div>
+                      <div><code>queryItems</code> also stays saved as authored. The same runtime tokens can be used there and are resolved in memory only.</div>
+                      <div><code>uniqueKey</code> supports runtime tokens such as <code>{orgId}</code> and <code>{siteId}</code>. It is resolved in memory for runtime fetches and does not need to be persisted as a concrete value in the saved block.</div>
+                      <div><code>collection.canonicalLookup.key</code> is optional. It also supports runtime tokens and CMS preview resolves them in memory before fetching the matching document directly.</div>
+                      <div><code>query</code> handles the final required filters.</div>
+                      <div><code>order</code> controls the final sort order.</div>
+                      <div><code>limit</code> caps the results.</div>
+                    </div>
+                  </section>
+
+                  <section id="arrays-api" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Arrays from an API
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {
+  "field":"list",
+  "api":"https://api.example.com/items",
+  "apiField":"data",
+  "apiQuery":"?limit=4",
+  "limit":4,
+  "value":[]
+}}}}</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div><code>api</code> is the base URL without the query string.</div>
+                      <div><code>apiQuery</code> is appended to the URL.</div>
+                      <div><code>apiField</code> tells the block which array to read from the response.</div>
+                    </div>
+                    <p class="text-sm text-foreground">
+                      Filters from <code>queryOptions</code> become query string parameters at runtime.
+                    </p>
+                  </section>
+
+                  <section id="arrays-filters" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Filters for Arrays (queryOptions)
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>"queryOptions":[
+  {
+    "field":"users",
+    "operator":"array-contains-any",
+    "options":"users",
+    "optionsKey":"name",
+    "optionsValue":"userId",
+    "multiple":true
+  }
+]</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div><code>queryOptions</code> adds filter controls for CMS users.</div>
+                      <div>The selected values are stored in <code>meta.queryItems</code>.</div>
+                      <div>If you manually author a key in <code>queryItems</code>, that value takes priority over a <code>queryOption</code> on the same key.</div>
+                      <div>In practice, you generally should not manually set a <code>queryItems</code> key if you want that same key to stay editable by CMS users.</div>
+                      <div><code>options</code> can be a collection name or a static array.</div>
+                      <div><code>multiple: true</code> saves an array of selected values.</div>
+                    </div>
+                  </section>
+
+                  <section id="arrays-query-flow" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      How Array Queries Work
+                    </h3>
+                    <ol class="list-decimal pl-5 text-sm text-foreground space-y-1">
+                      <li>Before runtime fetches, tokens in <code>collection.query</code>, <code>queryItems</code>, <code>uniqueKey</code>, and <code>collection.canonicalLookup.key</code> are resolved in memory only. Supported tokens include <code>{orgId}</code>, <code>{siteId}</code>, and <code>{routeLastSegment}</code>. The saved block keeps the original tokens.</li>
+                      <li>Each entry in <code>queryItems</code> makes its own indexed lookup through <code>kvClient.queryIndex</code>.</li>
+                      <li>For a query key to work, that field must be included in your KV mirror config (in <code>indexKeys</code> and in <code>metadataKeys</code> for list rendering).</li>
+                      <li>If you have more than one <code>queryItems</code> field, the runtime unions those matches into one candidate list (OR behavior at this stage).</li>
+                      <li>Duplicate records are removed by <code>canonical</code>, so the same item only shows up once.</li>
+                      <li>After that, <code>collection.query</code> filters candidates in JavaScript; all query clauses must pass for a record to survive (AND behavior across <code>collection.query</code> rules).</li>
+                      <li>Finally, <code>collection.order</code> sorts the remaining records.</li>
+                      <li>The finished array is written to <code>values[field]</code>.</li>
+                      <li>If the collection cannot be loaded, the block falls back to the inline <code>value</code> you provided, or to an empty array if there is no fallback value.</li>
+                    </ol>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>exports.onListingWritten = createKvMirrorHandlerFromFields({
+  documentPath: 'organizations/{orgId}/listings',
+  uniqueKey: '{orgId}',
+  indexKeys: ['name', 'city', 'state', 'status'],
+  metadataKeys: ['name', 'city', 'state', 'status', 'price', 'doc_created_at'],
+})</code></pre>
+                  </section>
+
+                  <section class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Query Strategy
+                    </h3>
+                    <p class="text-sm text-foreground">
+                      Use this setup when you want array queries to stay fast and predictable.
+                    </p>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div>1. Put the most selective indexed filters in <code>queryItems</code>. These should cut the candidate list down as early as possible.</div>
+                      <div>2. Put must-match rules in <code>collection.query</code>. Think of this as the final narrowing step.</div>
+                      <div>3. Use <code>collection.canonicalLookup.key</code> when you already know the exact document to fetch.</div>
+                      <div>4. Put final sorting in <code>collection.order</code>.</div>
+                      <div>5. Treat <code>queryOptions</code> as the editor UI for choosing filters. At runtime, the actual filtering is driven by <code>collection.query</code> and <code>queryItems</code>.</div>
+                    </div>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{
+  "field": "eventsList",
+  "collection": {
+    "path": "posts",
+    "query": [
+      { "field": "type", "operator": "==", "value": "event" },
+      { "field": "event.isPast", "operator": "==", "value": true }
+    ],
+    "order": [{ "field": "event.startAt", "direction": "asc" }]
+  },
+  "queryItems": {
+    "tags": ["program-spotlight"]
+  }
+}</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div><code>queryItems.tags</code> does the indexed lookup first.</div>
+                      <div><code>collection.query</code> then keeps only records that are actually events and already in the past.</div>
+                      <div><code>collection.order</code> sorts those remaining records by start date.</div>
+                    </div>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {"field":"siteDoc","collection":{"path":"sites","canonicalLookup":{"key":"{orgId}:{siteId}"},"order":[]},"value":[]}}}}</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div>Use <code>collection.canonicalLookup.key</code> when the exact document key is already known.</div>
+                      <div>For canonical-only fetches, <code>uniqueKey</code> and <code>limit</code> are not required.</div>
+                    </div>
+                  </section>
+
+                  <section id="conditionals" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Conditionals (Inside Arrays)
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#if {"cond":"item.price > 0"} }}}
+  <div>Price: {{item.price}}</div>
+{{{#else}}}
+  <div>Contact for pricing</div>
+{{{/if}}}</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div><code>cond</code> works with <code>item.*</code> inside array and subarray templates.</div>
+                      <div>Supported operators are <code>==</code>, <code>!=</code>, <code>&gt;</code>, <code>&lt;</code>, <code>&gt;=</code>, and <code>&lt;=</code>.</div>
+                    </div>
+                  </section>
+
+                  <section id="subarrays" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Subarrays (Nested Lists)
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {"field":"items","value":[],"as":"card"}}}}
+  <h3>{{card.title}}</h3>
+  {{{#subarray:child {"field":"item.children","limit":0 }}}}
+    <div>{{child}}</div>
+  {{{/subarray}}}
+{{{/array}}}</code></pre>
+                    <p class="text-sm text-foreground">
+                      Use <code>as</code> to create a clearer alias like <code v-pre>{{card.title}}</code>. Use <code>subarray</code> to loop over nested arrays.
+                    </p>
+                  </section>
+
+                  <section id="render-blocks" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Render Blocks (Post/Page Block Content)
+                    </h3>
+                    <p class="text-sm text-foreground">
+                      Use <code>renderBlocks</code> when an object inside the array contains CMS block content, such as a post body.
+                    </p>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#renderBlocks {"field":"item"}}}}</code></pre>
+                    <p class="text-sm text-foreground">
+                      Inside an array loop, <code>item</code> is the current record.
+                    </p>
+                    <p class="text-sm text-foreground">
+                      Inside that block render, use <code v-pre>{{renderItem.someField}}</code> to output values directly from the current item passed into <code>renderBlocks</code>.
+                    </p>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#array {"field":"list","schema":[{"field":"name","value":"text"},{"field":"content","value":"richtext"}],"collection":{"path":"posts","queryItems":{"name":"{routeLastSegment}"},"order":[]},"queryOptions":[],"limit":1,"value":[]}}}}
+  <article>
+    <h2>{{item.name}}</h2>
+    {{{#renderBlocks {"field":"item"}}}}
+  </article>
+{{{/array}}}</code></pre>
+                    <p class="text-sm text-foreground">
+                      Example block content rendered by <code>renderBlocks</code>:
+                    </p>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>&lt;article&gt;
+  &lt;h2&gt;{{renderItem.name}}&lt;/h2&gt;
+  {{{content}}}
+&lt;/article&gt;</code></pre>
+                  </section>
+
+                  <section id="entries" class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Entries (Object Key/Value Loops)
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>{{{#entries:pair {"field":"settings","value":{"theme":"dark","ctaText":"Contact Us"}}}}}
+  <div><strong>{{pair.key}}</strong>: {{pair.value}}</div>
+{{{/entries}}}
+
+{{{#entries:group {"field":"groupedItems","value":{"featured":["One","Two"],"archive":["Three"]}}}}}
+  <h4>{{group.key}}</h4>
+  {{{#subarray:child {"field":"item.value","value":[]}}}}
+    <div>{{child}}</div>
+  {{{/subarray}}}
+{{{/entries}}}</code></pre>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div><code>entries</code> loops over object fields instead of arrays.</div>
+                      <div>Each loop gives you <code>item.key</code> and <code>item.value</code>, plus alias access like <code v-pre>{{pair.key}}</code>.</div>
+                      <div>If one of those values is an array, use a nested <code>subarray</code> on <code>item.value</code>.</div>
+                      <div>If <code>field</code> is not an object, nothing is rendered.</div>
+                    </div>
                   </section>
                 </div>
               </div>
@@ -1515,11 +2565,12 @@ const exportCurrentBlock = () => {
                     </h3>
                     <div class="text-sm text-foreground space-y-1">
                       <div><code>cms-nav-root</code>: nav behavior root (required).</div>
+                      <div><code>cms-nav-item</code>: nav entry wrapper used for current-route detection (recommended for every route item).</div>
                       <div><code>cms-nav-toggle</code>: button that toggles open/closed (required).</div>
                       <div><code>cms-nav-panel</code>: right slide-out panel (required).</div>
                       <div><code>cms-nav-overlay</code>: backdrop click-to-close (optional but recommended).</div>
                       <div><code>cms-nav-close</code>: explicit close button in panel (optional).</div>
-                      <div><code>cms-nav-link</code>: links that should close panel on click (optional).</div>
+                      <div><code>cms-nav-link</code>: clickable route link; also closes panel on click and participates in current-route detection.</div>
                       <div><code>cms-nav-folder</code>: desktop folder wrapper for dropdown behavior (recommended).</div>
                       <div><code>cms-nav-folder-toggle</code>: desktop folder trigger link/button (recommended).</div>
                       <div><code>cms-nav-folder-menu</code>: desktop dropdown menu panel for folder items (recommended).</div>
@@ -1548,12 +2599,73 @@ const exportCurrentBlock = () => {
                     </div>
                   </section>
 
+                  <section class="space-y-2">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Current Route Styling
+                    </h3>
+                    <div class="text-sm text-foreground space-y-1">
+                      <div>Mark each nav entry wrapper with <code>.cms-nav-item</code> or <code>data-cms-nav-item</code>.</div>
+                      <div>Mark the actual clickable route link with <code>.cms-nav-link</code> or <code>data-cms-nav-link</code>.</div>
+                      <div>Add <code>data-cms-nav-current-class="..."</code> to any element inside that item that should receive active-route classes.</div>
+                      <div>Exact matches are current, and parent paths are also current. For example, <code>/services</code> matches both <code>/services</code> and <code>/services/estate-planning</code>.</div>
+                      <div>External links and hash links are ignored by the current-route helper.</div>
+                      <div>The runtime sets <code>data-cms-nav-current="true"</code> on the active item, the matching link, and any element using <code>data-cms-nav-current-class</code>.</div>
+                      <div>Exact matches get <code>aria-current="page"</code>; parent-path matches get <code>aria-current="true"</code>.</div>
+                      <div>Keep hover styles in your normal classes like <code>hover:text-navActive</code>; <code>data-cms-nav-current-class</code> is only for current-route styling.</div>
+                    </div>
+                  </section>
+
+                  <section class="space-y-3">
+                    <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                      Current Route Example
+                    </h3>
+                    <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>&lt;nav class="cms-nav-root" data-cms-nav-root&gt;
+  &lt;div class="cms-nav-item"&gt;
+    &lt;a
+      href="/about"
+      class="cms-nav-link hover:text-navActive"
+      data-cms-nav-current-class="!text-navActive"
+    &gt;
+      About
+    &lt;/a&gt;
+  &lt;/div&gt;
+
+  &lt;div
+    class="cms-nav-item"
+    data-cms-nav-current-class="border-b-2 border-navActive"
+  &gt;
+    &lt;a
+      href="/services"
+      class="cms-nav-link hover:text-navActive"
+      data-cms-nav-current-class="!text-navActive"
+    &gt;
+      Services
+    &lt;/a&gt;
+  &lt;/div&gt;
+
+  &lt;div class="cms-nav-item"&gt;
+    &lt;div
+      class="rounded-full px-4 py-2 transition"
+      data-cms-nav-current-class="bg-navActive/10"
+    &gt;
+      &lt;a
+        href="/services/estate-planning"
+        class="cms-nav-link uppercase tracking-widest hover:text-navActive"
+        data-cms-nav-current-class="!text-navActive"
+      &gt;
+        Estate Planning
+      &lt;/a&gt;
+    &lt;/div&gt;
+  &lt;/div&gt;
+&lt;/nav&gt;</code></pre>
+                  </section>
+
                   <section class="space-y-3">
                     <h3 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                       Nav Block Template (Copy / Paste)
                     </h3>
                     <pre v-pre class="rounded-md bg-muted p-3 text-xs overflow-auto"><code>&lt;div class="cms-nav-root cms-nav-sticky" data-cms-nav-root data-cms-nav-position="{{{#text {"field":"navPosition","title":"Menu Position","option":{"field":"navPosition","options":[{"title":"Right","name":"right"},{"title":"Left","name":"left"},{"title":"Center","name":"center"}],"optionsKey":"title","optionsValue":"name"},"value":"right"}}}}" data-cms-nav-close-on-link="true" data-cms-nav-top-class="bg-transparent border-transparent" data-cms-nav-scrolled-class="bg-navBg/80 backdrop-blur-lg shadow-lg" data-cms-nav-top-row-class="h-[64px] md:h-[88px] py-6 md:py-8" data-cms-nav-scrolled-row-class="h-[56px] md:h-[68px] py-5 md:py-4"&gt;
-  {{{#array {"field":"siteDoc","collection":{"path":"sites","uniqueKey":"{orgId}","query":[{"field":"docId","operator":"==","value":"{siteId}"}],"order":[]},"limit":1,"value":[]}}}}
+  {{{#array {"field":"siteDoc","collection":{"path":"sites","canonicalLookup":{"key":"{orgId}:{siteId}"},"order":[]},"value":[]}}}}
   &lt;nav class="cms-nav-main fixed inset-x-0 top-0 z-30 w-full bg-transparent text-navText"&gt;
     &lt;div class="relative w-full px-6 md:px-12"&gt;
       &lt;div class="cms-nav-layout flex h-[64px] md:h-[88px] items-center justify-between gap-6 py-6 md:py-8"&gt;
@@ -1568,28 +2680,28 @@ const exportCurrentBlock = () => {
         &lt;div class="cms-nav-desktop ml-auto flex items-center gap-2"&gt;
           &lt;ul class="hidden lg:flex items-center gap-x-[20px] pt-1 text-sm uppercase tracking-widest list-none m-0 p-0 [&amp;&gt;li]:m-0 [&amp;&gt;li&gt;a]:m-0"&gt;
             {{{#subarray:menuItem {"field":"item.menus.Site Root","limit":5,"value":[]}}}}
-            &lt;li class="relative group cms-nav-folder" data-cms-nav-folder&gt;
+            &lt;li class="relative group cms-nav-folder cms-nav-item" data-cms-nav-folder&gt;
               {{{#if {"cond":"menuItem.item.type == 'external'"}}}}
               &lt;a href="{{menuItem.item.url}}" class="cursor-pointer"&gt;{{menuItem.name}}&lt;/a&gt;
               {{{#else}}}
               {{{#if {"cond":"menuItem.item == '[object Object]'"}}}}
               {{{#entries:folderEntry {"field":"menuItem.item","value":{}}}}}
               {{{#if {"cond":"folderEntry.key == 'home'"}}}}
-              &lt;a href="/" class="cms-nav-folder-toggle cursor-pointer text-sideNavText" data-cms-nav-folder-toggle&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+              &lt;a href="/" class="cms-nav-link cms-nav-folder-toggle cursor-pointer text-sideNavText hover:text-navActive" data-cms-nav-folder-toggle data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
               {{{#else}}}
-              &lt;a href="/{{folderEntry.key}}" class="cms-nav-folder-toggle cursor-pointer text-sideNavText" data-cms-nav-folder-toggle&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+              &lt;a href="/{{folderEntry.key}}" class="cms-nav-link cms-nav-folder-toggle cursor-pointer text-sideNavText hover:text-navActive" data-cms-nav-folder-toggle data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
               {{{/if}}}
               &lt;div class="cms-nav-folder-menu absolute left-0 top-full z-40 hidden min-w-max whitespace-nowrap bg-sideNavBg text-sideNavText py-2 text-left px-12 normal-case tracking-normal shadow-xl" data-cms-nav-folder-menu&gt;
               &lt;ul&gt;
                 {{{#subarray:folderChild {"field":"item.value","value":[]}}}}
-                &lt;li class="py-1"&gt;
+                &lt;li class="py-1 cms-nav-item"&gt;
                   {{{#if {"cond":"folderChild.item.type == 'external'"}}}}
                   &lt;a href="{{folderChild.item.url}}" class="block cursor-pointer whitespace-nowrap text-sideNavText"&gt;{{folderChild.name}}&lt;/a&gt;
                   {{{#else}}}
                   {{{#if {"cond":"folderChild.menuTitle"}}}}
-                  &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="block cursor-pointer whitespace-nowrap text-sideNavText"&gt;{{folderChild.menuTitle}}&lt;/a&gt;
+                  &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="cms-nav-link block cursor-pointer whitespace-nowrap text-sideNavText hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{folderChild.menuTitle}}&lt;/a&gt;
                   {{{#else}}}
-                  &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="block cursor-pointer whitespace-nowrap text-sideNavText"&gt;{{folderChild.name}}&lt;/a&gt;
+                  &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="cms-nav-link block cursor-pointer whitespace-nowrap text-sideNavText hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{folderChild.name}}&lt;/a&gt;
                   {{{/if}}}
                   {{{/if}}}
                 &lt;/li&gt;
@@ -1600,15 +2712,15 @@ const exportCurrentBlock = () => {
               {{{#else}}}
               {{{#if {"cond":"menuItem.name == 'home'"}}}}
               {{{#if {"cond":"menuItem.menuTitle"}}}}
-              &lt;a href="/" class="cursor-pointer"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+              &lt;a href="/" class="cms-nav-link cursor-pointer hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
               {{{#else}}}
-              &lt;a href="/" class="cursor-pointer"&gt;{{menuItem.name}}&lt;/a&gt;
+              &lt;a href="/" class="cms-nav-link cursor-pointer hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.name}}&lt;/a&gt;
               {{{/if}}}
               {{{#else}}}
               {{{#if {"cond":"menuItem.menuTitle"}}}}
-              &lt;a href="/{{menuItem.name}}" class="cursor-pointer"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+              &lt;a href="/{{menuItem.name}}" class="cms-nav-link cursor-pointer hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
               {{{#else}}}
-              &lt;a href="/{{menuItem.name}}" class="cursor-pointer"&gt;{{menuItem.name}}&lt;/a&gt;
+              &lt;a href="/{{menuItem.name}}" class="cms-nav-link cursor-pointer hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.name}}&lt;/a&gt;
               {{{/if}}}
               {{{/if}}}
               {{{/if}}}
@@ -1645,27 +2757,27 @@ const exportCurrentBlock = () => {
 
       &lt;ul class="w-full space-y-4 border-b border-black pb-4 uppercase"&gt;
         {{{#subarray:menuItem {"field":"item.menus.Site Root","value":[]}}}}
-        &lt;li class="border-t border-black pt-4"&gt;
+        &lt;li class="border-t border-black pt-4 cms-nav-item"&gt;
           {{{#if {"cond":"menuItem.item.type == 'external'"}}}}
-          &lt;a href="{{menuItem.item.url}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm"&gt;{{menuItem.name}}&lt;/a&gt;
+          &lt;a href="{{menuItem.item.url}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm hover:text-navActive"&gt;{{menuItem.name}}&lt;/a&gt;
           {{{#else}}}
           {{{#if {"cond":"menuItem.item == '[object Object]'"}}}}
           {{{#entries:folderEntry {"field":"menuItem.item","value":{}}}}}
           {{{#if {"cond":"folderEntry.key == 'home'"}}}}
-          &lt;a href="/" class="cms-nav-link block text-sideNavText tracking-widest text-sm"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+          &lt;a href="/" class="cms-nav-link block text-sideNavText tracking-widest text-sm hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
           {{{#else}}}
-          &lt;a href="/{{folderEntry.key}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+          &lt;a href="/{{folderEntry.key}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
           {{{/if}}}
           &lt;ul class="mt-2 space-y-2 border-l border-black/40 pl-4"&gt;
             {{{#subarray:folderChild {"field":"item.value","value":[]}}}}
-            &lt;li&gt;
+            &lt;li class="cms-nav-item"&gt;
               {{{#if {"cond":"folderChild.item.type == 'external'"}}}}
-              &lt;a href="{{folderChild.item.url}}" class="cms-nav-link block text-sideNavText tracking-widest text-xs"&gt;{{folderChild.name}}&lt;/a&gt;
+              &lt;a href="{{folderChild.item.url}}" class="cms-nav-link block text-sideNavText tracking-widest text-xs hover:text-navActive"&gt;{{folderChild.name}}&lt;/a&gt;
               {{{#else}}}
               {{{#if {"cond":"folderChild.menuTitle"}}}}
-              &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-xs"&gt;{{folderChild.menuTitle}}&lt;/a&gt;
+              &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-xs hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{folderChild.menuTitle}}&lt;/a&gt;
               {{{#else}}}
-              &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-xs"&gt;{{folderChild.name}}&lt;/a&gt;
+              &lt;a href="/{{folderEntry.key}}/{{folderChild.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-xs hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{folderChild.name}}&lt;/a&gt;
               {{{/if}}}
               {{{/if}}}
             &lt;/li&gt;
@@ -1675,15 +2787,15 @@ const exportCurrentBlock = () => {
           {{{#else}}}
           {{{#if {"cond":"menuItem.name == 'home'"}}}}
           {{{#if {"cond":"menuItem.menuTitle"}}}}
-          &lt;a href="/" class="cms-nav-link block text-sideNavText tracking-widest text-sm"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+          &lt;a href="/" class="cms-nav-link block text-sideNavText tracking-widest text-sm hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
           {{{#else}}}
-          &lt;a href="/" class="cms-nav-link block text-sideNavText tracking-widest text-sm"&gt;{{menuItem.name}}&lt;/a&gt;
+          &lt;a href="/" class="cms-nav-link block text-sideNavText tracking-widest text-sm hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.name}}&lt;/a&gt;
           {{{/if}}}
           {{{#else}}}
           {{{#if {"cond":"menuItem.menuTitle"}}}}
-          &lt;a href="/{{menuItem.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
+          &lt;a href="/{{menuItem.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.menuTitle}}&lt;/a&gt;
           {{{#else}}}
-          &lt;a href="/{{menuItem.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm"&gt;{{menuItem.name}}&lt;/a&gt;
+          &lt;a href="/{{menuItem.name}}" class="cms-nav-link block text-sideNavText tracking-widest text-sm hover:text-navActive" data-cms-nav-current-class="!text-navActive"&gt;{{menuItem.name}}&lt;/a&gt;
           {{{/if}}}
           {{{/if}}}
           {{{/if}}}
@@ -1846,6 +2958,7 @@ const exportCurrentBlock = () => {
         &lt;label for="cms-company"&gt;Company&lt;/label&gt;
         &lt;input id="cms-company" name="company" type="text" tabindex="-1" autocomplete="off" /&gt;
       &lt;/div&gt;
+      &lt;input type="hidden" name="subject" value="New Website Contact Form Submission" /&gt;
 
       &lt;div class="space-y-4"&gt;
         {{{#array {"field":"formFields","schema":[{"field":"fieldName","type":"text","title":"Field Label"},{"field":"fieldType","type":"option","title":"Field Type","option":{"optionsKey":"title","optionsValue":"value","options":[{"title":"Text","value":"text"},{"title":"Email","value":"email"},{"title":"Phone","value":"tel"},{"title":"Textarea","value":"textarea"}]},"value":"text"},{"field":"fieldRequired","type":"option","title":"Required","option":{"optionsKey":"title","optionsValue":"value","options":[{"title":"Yes","value":"true"},{"title":"No","value":"false"}]},"value":"true"}],"value":[{"fieldName":"Name","fieldType":"text","fieldRequired":"true"},{"fieldName":"Email","fieldType":"email","fieldRequired":"true"},{"fieldName":"Message","fieldType":"textarea","fieldRequired":"true"}]}}}}
@@ -1889,7 +3002,9 @@ const exportCurrentBlock = () => {
     &lt;/form&gt;
 
     &lt;div class="hidden"&gt;
-      {{{#text {"field":"emailTo","title":"Email To","value":"test@testing.com"}}}}
+      {{{#array {"field":"emailTo","value":["test@testing.com"]}}}}
+       <!-- nothing here ! -->
+      {{{/array}}}
     &lt;/div&gt;
   &lt;/div&gt;
 &lt;/section&gt;</code></pre>

@@ -56,11 +56,11 @@ const props = defineProps({
   },
   headerClass: {
     type: String,
-    default: 'bg-secondary py-2',
+    default: 'py-2 border-b border-slate-300 bg-slate-100 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100',
   },
   footerClass: {
     type: String,
-    default: 'justify-end py-2 bg-secondary',
+    default: 'justify-end py-2 border-t border-slate-300 bg-slate-100 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100',
   },
   searchFields: {
     type: Array,
@@ -719,7 +719,7 @@ const addFilter = (field, value) => {
         </template>
       </edge-menu>
     </slot>
-    <div v-if="$slots['list-header']" class="flex flex-wrap items-center py-0 mx-8 text-sm">
+    <div v-if="$slots['list-header']" class="flex flex-wrap items-center py-0 mx-1 text-sm">
       <slot name="list-header" />
     </div>
     <CardContent
