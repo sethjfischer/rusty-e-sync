@@ -11,6 +11,7 @@ const {
   onDocumentDeleted,
   onDocumentCreated,
   onMessagePublished,
+  onSchedule,
   onRequest,
   Firestore,
   permissionCheck,
@@ -146,6 +147,7 @@ const SITE_USER_META_FIELDS = [
   'socialYouTube',
   'socialTikTok',
 ]
+const DEFAULT_CONTACT_FORM_SUBJECT = 'Contact Form Submission'
 
 const pickSyncFields = (source = {}) => {
   const payload = {}
@@ -218,6 +220,13 @@ const normalizeEmail = (value) => {
     return ''
   const trimmed = String(value).trim()
   return trimmed.includes('@') ? trimmed : ''
+}
+
+const normalizeEmailList = (value) => {
+  if (Array.isArray(value))
+    return value.map(item => normalizeEmail(item)).filter(Boolean)
+  const single = normalizeEmail(value)
+  return single ? [single] : []
 }
 
 const normalizeDomain = (value) => {
@@ -469,6 +478,45 @@ const removeCloudflarePagesDomain = async (domain, context = {}) => {
   }
 }
 
+const cleanupOwnedPublishedSiteDomains = async (sitePath, { orgId, siteId } = {}) => {
+  const normalizedSitePath = String(sitePath || '').trim()
+  if (!normalizedSitePath)
+    return
+
+  const registrySnap = await db.collection(DOMAIN_REGISTRY_COLLECTION)
+    .where('sitePath', '==', normalizedSitePath)
+    .get()
+
+  if (registrySnap.empty)
+    return
+
+  const removeDomains = Array.from(new Set(
+    registrySnap.docs
+      .flatMap((doc) => {
+        const data = doc.data() || {}
+        const normalizedDomain = normalizeDomain(data.domain || doc.id)
+        const apexDomain = normalizeDomain(data.apexDomain || getCloudflareApexDomain(normalizedDomain))
+        const wwwDomain = normalizeDomain(data.wwwDomain || getCloudflarePagesDomain(apexDomain))
+        return [wwwDomain, apexDomain]
+      })
+      .filter(domain => shouldSyncCloudflareDomain(domain)),
+  ))
+
+  if (removeDomains.length) {
+    await Promise.all(removeDomains.map(domain => removeCloudflarePagesDomain(domain, {
+      orgId,
+      siteId,
+      trigger: 'published-site-settings-delete',
+    })))
+  }
+
+  const batch = db.batch()
+  registrySnap.docs.forEach((doc) => {
+    batch.delete(doc.ref)
+  })
+  await batch.commit()
+}
+
 const collectFormEntries = (data) => {
   if (!data || typeof data !== 'object')
     return []
@@ -539,6 +587,21 @@ const getReplyToEmail = (data, entries) => {
   return normalizeEmail(entry?.value)
 }
 
+const getContactFormSubject = (data, entries) => {
+  if (data && typeof data === 'object') {
+    const directKey = Object.keys(data).find(key => key.toLowerCase() === 'subject')
+    if (directKey) {
+      const direct = String(data[directKey] || '').trim()
+      if (direct)
+        return direct
+    }
+  }
+
+  const entry = entries.find(item => item.key.toLowerCase() === 'subject')
+  const value = String(entry?.value || '').trim()
+  return value || DEFAULT_CONTACT_FORM_SUBJECT
+}
+
 const escapeHtml = (value) => {
   return String(value)
     .replace(/&/g, '&amp;')
@@ -565,18 +628,18 @@ const formatValue = (value) => {
 
 const getPublishedEmailTo = async (orgId, siteId, pageId, blockId) => {
   if (!orgId || !siteId || !pageId || !blockId)
-    return ''
+    return []
   const publishedRef = db.collection('organizations').doc(orgId).collection('sites').doc(siteId).collection('published').doc(pageId)
   const snap = await publishedRef.get()
   if (!snap.exists)
-    return ''
+    return []
   const data = snap.data() || {}
   const content = Array.isArray(data.content) ? data.content : []
   const block = content.find(item => String(item?.id || '') === blockId || String(item?.blockId || '') === blockId)
   if (!block)
-    return ''
-  const emailTo = block?.values?.emailTo || block?.emailTo || ''
-  return String(emailTo || '').trim()
+    return []
+  const emailTo = block?.values?.emailTo ?? block?.emailTo ?? ''
+  return normalizeEmailList(emailTo)
 }
 
 const getSiteSettingsEmail = async (orgId, siteId) => {
@@ -595,6 +658,7 @@ const getSiteSettingsEmail = async (orgId, siteId) => {
 const sendContactFormEmail = async ({
   to,
   replyTo,
+  subject,
   entries,
   orgId,
   siteId,
@@ -605,6 +669,9 @@ const sendContactFormEmail = async ({
     logger.error('SendGrid config missing')
     return
   }
+  const recipients = normalizeEmailList(to)
+  if (!recipients.length)
+    return
 
   const fieldLines = entries.length
     ? entries.map(entry => `- ${entry.key}: ${formatValue(entry.value)}`)
@@ -618,13 +685,13 @@ const sendContactFormEmail = async ({
     : '<li>(no fields provided)</li>'
   const htmlBody = `
     <div>
-      <h2>Contact Form Submission</h2>
+      <h2>${escapeHtml(subject || DEFAULT_CONTACT_FORM_SUBJECT)}</h2>
       <ul>${htmlFields}</ul>
     </div>
   `
 
   await axios.post('https://api.sendgrid.com/v3/mail/send', {
-    personalizations: [{ to: [{ email: to }], subject: 'Contact Form Submission' }],
+    personalizations: [{ to: recipients.map(email => ({ email })), subject: subject || DEFAULT_CONTACT_FORM_SUBJECT }],
     from: { email: SENDGRID_FROM_EMAIL },
     reply_to: { email: replyTo || SENDGRID_FROM_EMAIL },
     content: [
@@ -749,17 +816,19 @@ exports.trackHistory = onRequest(async (req, res) => {
         try {
           const entries = collectFormEntries(data)
           const replyTo = getReplyToEmail(data, entries)
-          const blockEmail = normalizeEmail(await getPublishedEmailTo(orgId, siteId, pageId, blockId))
+          const subject = getContactFormSubject(data, entries)
+          const blockEmails = await getPublishedEmailTo(orgId, siteId, pageId, blockId)
           const fallbackEmail = await getSiteSettingsEmail(orgId, siteId)
-          const emailTo = blockEmail || fallbackEmail
+          const emailTo = blockEmails.length ? blockEmails : (fallbackEmail ? [fallbackEmail] : [])
 
-          if (!emailTo) {
+          if (!emailTo.length) {
             logger.warn('Contact form email not found', { orgId, siteId, pageId, blockId })
           }
           else {
             await sendContactFormEmail({
               to: emailTo,
               replyTo,
+              subject,
               entries,
               orgId,
               siteId,
@@ -857,10 +926,12 @@ const collectSyncedBlocks = (content, postContent) => {
   return syncedBlocks
 }
 
-const BLOCK_META_EXCLUDE_KEYS = new Set(['queryItems', 'limit'])
+const BLOCK_META_EXCLUDE_KEYS = new Set(['limit'])
 
-const updateBlocksInArray = (blocks, blockId, afterData) => {
+const updateBlocksInArray = (blocks, blockId, beforeData, afterData) => {
   let touched = false
+  const beforeMeta = beforeData?.meta || {}
+  const afterMeta = afterData?.meta || {}
   for (const block of blocks) {
     if (block?.blockId !== blockId)
       continue
@@ -869,11 +940,32 @@ const updateBlocksInArray = (blocks, blockId, afterData) => {
       block.content = afterData.content
 
     block.meta = block.meta || {}
-    const srcMeta = afterData.meta || {}
+    const srcMeta = afterMeta
     for (const key of Object.keys(srcMeta)) {
       block.meta[key] = block.meta[key] || {}
       const src = srcMeta[key] || {}
+      const previousTemplateQueryItems = (beforeMeta[key]?.queryItems && typeof beforeMeta[key].queryItems === 'object')
+        ? beforeMeta[key].queryItems
+        : {}
+      const nextTemplateQueryItems = (src.queryItems && typeof src.queryItems === 'object')
+        ? src.queryItems
+        : {}
       for (const metaKey of Object.keys(src)) {
+        if (metaKey === 'queryItems') {
+          const existingQueryItems = (block.meta[key].queryItems && typeof block.meta[key].queryItems === 'object')
+            ? block.meta[key].queryItems
+            : {}
+          const deletedTemplateKeys = Object.keys(previousTemplateQueryItems)
+            .filter(queryKey => !Object.prototype.hasOwnProperty.call(nextTemplateQueryItems, queryKey))
+          const nextQueryItems = { ...existingQueryItems }
+          for (const queryKey of deletedTemplateKeys)
+            delete nextQueryItems[queryKey]
+          block.meta[key].queryItems = {
+            ...nextQueryItems,
+            ...nextTemplateQueryItems,
+          }
+          continue
+        }
         if (BLOCK_META_EXCLUDE_KEYS.has(metaKey))
           continue
         block.meta[key][metaKey] = src[metaKey]
@@ -885,12 +977,12 @@ const updateBlocksInArray = (blocks, blockId, afterData) => {
   return touched
 }
 
-const buildPageBlockUpdate = (pageData, blockId, afterData) => {
+const buildPageBlockUpdate = (pageData, blockId, beforeData, afterData) => {
   const pageContent = Array.isArray(pageData.content) ? [...pageData.content] : []
   const pagePostContent = Array.isArray(pageData.postContent) ? [...pageData.postContent] : []
 
-  const contentTouched = updateBlocksInArray(pageContent, blockId, afterData)
-  const postContentTouched = updateBlocksInArray(pagePostContent, blockId, afterData)
+  const contentTouched = updateBlocksInArray(pageContent, blockId, beforeData, afterData)
+  const postContentTouched = updateBlocksInArray(pagePostContent, blockId, beforeData, afterData)
 
   return {
     touched: contentTouched || postContentTouched,
@@ -899,10 +991,40 @@ const buildPageBlockUpdate = (pageData, blockId, afterData) => {
   }
 }
 
+const getNextVersion = (value) => {
+  const numericVersion = Number(value)
+  if (!Number.isFinite(numericVersion))
+    return 1
+  return Math.max(0, Math.trunc(numericVersion)) + 1
+}
+
+const syncPageVersionMaps = async ({ orgId, siteId, pageId, version }) => {
+  if (!orgId || !siteId || !pageId)
+    return
+
+  const orgRef = db.collection('organizations').doc(orgId)
+  const sitesRef = orgRef.collection('sites').doc(siteId)
+  const publishedSettingsRef = orgRef.collection('published-site-settings').doc(siteId)
+
+  await Promise.all([
+    sitesRef.set({
+      pageVersions: {
+        [pageId]: version,
+      },
+    }, { merge: true }),
+    publishedSettingsRef.set({
+      pageVersions: {
+        [pageId]: version,
+      },
+    }, { merge: true }),
+  ])
+}
+
 exports.blockUpdated = onDocumentUpdated({ document: 'organizations/{orgId}/blocks/{blockId}', timeoutSeconds: 180 }, async (event) => {
   const change = event.data
   const blockId = event.params.blockId
   const orgId = event.params.orgId
+  const beforeData = change.before.data() || {}
   const afterData = change.after.data() || {}
 
   const sites = await db.collection('organizations').doc(orgId).collection('sites').get()
@@ -911,57 +1033,106 @@ exports.blockUpdated = onDocumentUpdated({ document: 'organizations/{orgId}/bloc
 
   const processedSiteIds = new Set()
 
-  const updatePagesForSite = async (siteId, { updatePublished = true, scopeLabel }) => {
+  const updateDocsForSiteCollection = async (siteId, {
+    collectionName,
+    publishedCollectionName = '',
+    docLabel = 'doc',
+    updatePublished = true,
+    scopeLabel,
+  }) => {
     const pagesSnap = await db.collection('organizations').doc(orgId)
       .collection('sites').doc(siteId)
-      .collection('pages')
+      .collection(collectionName)
       .where('blockIds', 'array-contains', blockId)
       .get()
 
     if (pagesSnap.empty) {
-      logger.log(`No pages found using block ${blockId} in ${scopeLabel}`)
+      logger.log(`No ${collectionName} found using block ${blockId} in ${scopeLabel}`)
       return
     }
 
     for (const pageDoc of pagesSnap.docs) {
       const pageData = pageDoc.data() || {}
-      const { touched, content, postContent } = buildPageBlockUpdate(pageData, blockId, afterData)
+      const { touched, content, postContent } = buildPageBlockUpdate(pageData, blockId, beforeData, afterData)
 
       if (!touched) {
-        logger.log(`Page ${pageDoc.id} has no matching block ${blockId} in ${scopeLabel}`)
+        logger.log(`${docLabel} ${pageDoc.id} has no matching block ${blockId} in ${scopeLabel}`)
         continue
       }
 
-      await pageDoc.ref.update({ content, postContent })
+      const shouldTrackPageVersion = collectionName === 'pages'
+      const nextVersion = shouldTrackPageVersion ? getNextVersion(pageData?.version) : null
+      const draftUpdate = shouldTrackPageVersion
+        ? { content, postContent, version: nextVersion }
+        : { content, postContent }
 
-      if (updatePublished) {
+      await pageDoc.ref.update(draftUpdate)
+
+      if (updatePublished && publishedCollectionName) {
         const publishedRef = db.collection('organizations').doc(orgId)
           .collection('sites').doc(siteId)
-          .collection('published').doc(pageDoc.id)
+          .collection(publishedCollectionName).doc(pageDoc.id)
 
         const publishedDoc = await publishedRef.get()
         if (publishedDoc.exists) {
-          await publishedRef.update({ content, postContent })
+          const publishedUpdate = shouldTrackPageVersion
+            ? { content, postContent, version: nextVersion }
+            : { content, postContent }
+          await publishedRef.update(publishedUpdate)
+        }
+
+        if (shouldTrackPageVersion) {
+          await syncPageVersionMaps({
+            orgId,
+            siteId,
+            pageId: pageDoc.id,
+            version: nextVersion,
+          })
         }
       }
 
-      logger.log(`Updated page ${pageDoc.id} in ${scopeLabel} with new block ${blockId} content`)
+      logger.log(`Updated ${docLabel} ${pageDoc.id} in ${scopeLabel} with new block ${blockId} content`)
     }
   }
 
   for (const siteDoc of sites.docs) {
     const siteId = siteDoc.id
     processedSiteIds.add(siteId)
-    await updatePagesForSite(siteId, {
-      updatePublished: siteId !== 'templates',
-      scopeLabel: siteId === 'templates'
-        ? `templates site (org ${orgId})`
-        : `site ${siteId} (org ${orgId})`,
+    const updatePublished = siteId !== 'templates'
+    const scopeLabel = siteId === 'templates'
+      ? `templates site (org ${orgId})`
+      : `site ${siteId} (org ${orgId})`
+
+    await updateDocsForSiteCollection(siteId, {
+      collectionName: 'pages',
+      publishedCollectionName: 'published',
+      docLabel: 'page',
+      updatePublished,
+      scopeLabel,
+    })
+
+    await updateDocsForSiteCollection(siteId, {
+      collectionName: 'posts',
+      publishedCollectionName: 'published_posts',
+      docLabel: 'post',
+      updatePublished,
+      scopeLabel,
     })
   }
 
   if (!processedSiteIds.has('templates')) {
-    await updatePagesForSite('templates', {
+    await updateDocsForSiteCollection('templates', {
+      collectionName: 'pages',
+      publishedCollectionName: 'published',
+      docLabel: 'page',
+      updatePublished: false,
+      scopeLabel: `templates site (org ${orgId})`,
+    })
+
+    await updateDocsForSiteCollection('templates', {
+      collectionName: 'posts',
+      publishedCollectionName: 'published_posts',
+      docLabel: 'post',
       updatePublished: false,
       scopeLabel: `templates site (org ${orgId})`,
     })
@@ -1035,6 +1206,50 @@ exports.fontFileUpdated = onDocumentUpdated({ document: 'organizations/{orgId}/f
 })
 
 const slug = s => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80)
+const toBool = (value, fallback = false) => {
+  if (typeof value === 'boolean')
+    return value
+  return fallback
+}
+
+const eventEndAtMs = (eventData = {}) => {
+  const endAtUtc = String(eventData.endAtUtc || '').trim()
+  if (endAtUtc) {
+    const utcMs = Date.parse(endAtUtc)
+    if (Number.isFinite(utcMs))
+      return utcMs
+  }
+
+  const endAt = String(eventData.endAt || '').trim()
+  if (!endAt)
+    return Number.NaN
+  const fallbackMs = Date.parse(endAt)
+  return Number.isFinite(fallbackMs) ? fallbackMs : Number.NaN
+}
+
+const canPublishEventAt = (postData = {}, publishAtMs = Date.now()) => {
+  const rawType = String(postData?.type || 'post').trim().toLowerCase()
+  if (rawType !== 'event')
+    return { allowed: true, reason: '' }
+
+  const eventData = (postData && typeof postData.event === 'object') ? postData.event : {}
+  const unpublishPastEvent = toBool(eventData.unpublishPastEvent, true)
+  if (!unpublishPastEvent)
+    return { allowed: true, reason: '' }
+
+  const endAtMs = eventEndAtMs(eventData)
+  if (!Number.isFinite(endAtMs))
+    return { allowed: true, reason: '' }
+
+  if (endAtMs <= publishAtMs) {
+    return {
+      allowed: false,
+      reason: 'Event endAt is earlier than publishAt while unpublishPastEvent is enabled.',
+    }
+  }
+  return { allowed: true, reason: '' }
+}
+
 const yyyyMM = (d) => {
   const dt = d ? new Date(d) : new Date()
   const y = dt.getUTCFullYear()
@@ -1061,6 +1276,27 @@ exports.onPostWritten = createKvMirrorHandler({
         keys.push(`idx:posts:tags:${orgId}:${siteId}:${st}:${postId}`)
     }
 
+    // by type
+    const rawType = String(data?.type || 'post').trim().toLowerCase()
+    if (rawType) {
+      keys.push(`idx:posts:type:${orgId}:${siteId}:${slug(rawType)}:${postId}`)
+    }
+
+    const eventData = (data && typeof data.event === 'object') ? data.event : {}
+    const startAtValue = String(eventData.startAt || '').trim()
+    if (startAtValue) {
+      keys.push(`idx:posts:startAt:${orgId}:${siteId}:${startAtValue}:${postId}`)
+      keys.push(`idx:posts:event.startAt:${orgId}:${siteId}:${startAtValue}:${postId}`)
+    }
+    const endAtValue = String(eventData.endAt || '').trim()
+    if (endAtValue) {
+      keys.push(`idx:posts:endAt:${orgId}:${siteId}:${endAtValue}:${postId}`)
+      keys.push(`idx:posts:event.endAt:${orgId}:${siteId}:${endAtValue}:${postId}`)
+    }
+    const isPastValue = toBool(eventData.isPast, false) ? 'true' : 'false'
+    keys.push(`idx:posts:isPast:${orgId}:${siteId}:${isPastValue}:${postId}`)
+    keys.push(`idx:posts:event.isPast:${orgId}:${siteId}:${isPastValue}:${postId}`)
+
     // by date (archive buckets)
     const pub = data?.publishedAt || data?.doc_created_at || data?.createdAt || null
     if (pub)
@@ -1068,7 +1304,7 @@ exports.onPostWritten = createKvMirrorHandler({
 
     // by slug (direct lookup)
     if (data?.name)
-      keys.push(`idx:posts:slugs:${orgId}:${siteId}:${data.name}`)
+      keys.push(`idx:posts:name:${orgId}:${siteId}:${data.name}`)
 
     return keys
   },
@@ -1077,23 +1313,329 @@ exports.onPostWritten = createKvMirrorHandler({
   serialize: data => JSON.stringify(data),
 
   // tiny metadata so you can render lists without N GETs (stored in meta:{key})
-  makeMetadata: data => ({
-    title: data?.title || '',
-    blurb: data?.blurb || '',
-    doc_created_at: data?.doc_created_at || '',
-    featuredImage: data?.featuredImage || '',
-    name: data?.name || '',
-  }),
+  makeMetadata: (data) => {
+    const eventData = (data && typeof data.event === 'object') ? data.event : {}
+    const startAt = String(eventData.startAt || '')
+    const endAt = String(eventData.endAt || '')
+    return {
+      title: data?.title || '',
+      blurb: data?.blurb || '',
+      doc_created_at: data?.doc_created_at || '',
+      featuredImage: data?.featuredImage || '',
+      name: data?.name || '',
+      type: (String(data?.type || 'post').trim().toLowerCase() || 'post'),
+      event: {
+        startAt,
+        endAt,
+        isPast: toBool(eventData.isPast, false),
+        locationName: String(eventData.locationName || ''),
+      },
+    }
+  },
 
   timeoutSeconds: 180,
 })
+
+exports.syncPastPublishedEvents = onSchedule(
+  { schedule: 'every 1 minutes', timeoutSeconds: 540 },
+  async () => {
+    const pageSize = 250
+    let scanned = 0
+    let eventDocs = 0
+    let updated = 0
+    let updatedPosts = 0
+    let unpublished = 0
+    let lastDoc = null
+
+    while (true) {
+      let query = db.collectionGroup('published_posts')
+        .orderBy(admin.firestore.FieldPath.documentId())
+        .limit(pageSize)
+
+      if (lastDoc)
+        query = query.startAfter(lastDoc)
+
+      const snap = await query.get()
+      if (snap.empty)
+        break
+
+      let batch = db.batch()
+      let ops = 0
+
+      for (const docSnap of snap.docs) {
+        scanned += 1
+        const data = docSnap.data() || {}
+        const rawType = String(data?.type || 'post').trim().toLowerCase()
+        if (rawType !== 'event')
+          continue
+        eventDocs += 1
+        const pathParts = String(docSnap.ref.path || '').split('/').filter(Boolean)
+        const hasPostPath = pathParts.length === 6 && pathParts[0] === 'organizations' && pathParts[2] === 'sites' && pathParts[4] === 'published_posts'
+        const postRef = hasPostPath
+          ? db.collection('organizations').doc(pathParts[1]).collection('sites').doc(pathParts[3]).collection('posts').doc(pathParts[5])
+          : null
+
+        const eventData = (data && typeof data.event === 'object') ? data.event : {}
+        const endAtMs = eventEndAtMs(eventData)
+        const isPast = Number.isFinite(endAtMs) ? endAtMs <= Date.now() : false
+        const unpublishPastEvent = toBool(eventData.unpublishPastEvent, true)
+        const needsIsPastUpdate = toBool(eventData.isPast, false) !== isPast
+        const needsUnpublishDefault = typeof eventData.unpublishPastEvent !== 'boolean'
+
+        if (isPast && unpublishPastEvent) {
+          batch.delete(docSnap.ref)
+          unpublished += 1
+          ops += 1
+
+          if (postRef && (needsIsPastUpdate || needsUnpublishDefault)) {
+            const postUpdates = {}
+            if (needsIsPastUpdate)
+              postUpdates['event.isPast'] = isPast
+            if (needsUnpublishDefault)
+              postUpdates['event.unpublishPastEvent'] = true
+            batch.set(postRef, postUpdates, { merge: true })
+            updatedPosts += 1
+            ops += 1
+          }
+        }
+        else {
+          if (needsIsPastUpdate || needsUnpublishDefault) {
+            const updates = {}
+            if (needsIsPastUpdate)
+              updates['event.isPast'] = isPast
+            if (needsUnpublishDefault)
+              updates['event.unpublishPastEvent'] = true
+            batch.update(docSnap.ref, updates)
+            updated += 1
+            ops += 1
+
+            if (postRef) {
+              batch.set(postRef, updates, { merge: true })
+              updatedPosts += 1
+              ops += 1
+            }
+          }
+        }
+
+        if (ops >= 400) {
+          await batch.commit()
+          batch = db.batch()
+          ops = 0
+        }
+      }
+
+      if (ops > 0)
+        await batch.commit()
+
+      lastDoc = snap.docs[snap.docs.length - 1]
+      if (snap.size < pageSize)
+        break
+    }
+
+    logger.log('syncPastPublishedEvents complete', {
+      scanned,
+      eventDocs,
+      updated,
+      updatedPosts,
+      unpublished,
+    })
+  },
+)
+
+exports.publishScheduledPosts = onSchedule(
+  { schedule: 'every 1 minutes', timeoutSeconds: 540 },
+  async () => {
+    const pageSize = 200
+    const nowMs = Date.now()
+    const nowIso = new Date(nowMs).toISOString()
+
+    let scanned = 0
+    let withSchedule = 0
+    let published = 0
+    let skipped = 0
+    let unscheduled = 0
+
+    let lastDoc = null
+
+    for (;;) {
+      let query = db.collectionGroup('posts')
+        .orderBy(admin.firestore.FieldPath.documentId())
+        .limit(pageSize)
+
+      if (lastDoc)
+        query = query.startAfter(lastDoc)
+
+      const snap = await query.get()
+
+      if (snap.empty)
+        break
+
+      let batch = db.batch()
+      let ops = 0
+
+      for (const draftSnap of snap.docs) {
+        scanned += 1
+        const draftData = draftSnap.data() || {}
+        const publishAtRaw = String(draftData.publishAt || '').trim()
+        if (!publishAtRaw)
+          continue
+        withSchedule += 1
+        const publishAtMs = publishAtRaw ? Date.parse(publishAtRaw) : Number.NaN
+        const effectivePublishMs = Number.isFinite(publishAtMs) ? publishAtMs : nowMs
+        const isDue = Number.isFinite(publishAtMs) ? publishAtMs <= nowMs : true
+        if (!isDue)
+          continue
+
+        const pathParts = draftSnap.ref.path.split('/')
+        if (pathParts.length !== 6) {
+          batch.update(draftSnap.ref, {
+            publishAt: Firestore.FieldValue.delete(),
+            publishAtTimezone: Firestore.FieldValue.delete(),
+          })
+          unscheduled += 1
+          ops += 1
+          continue
+        }
+        const orgId = pathParts[1]
+        const siteId = pathParts[3]
+        const postId = pathParts[5]
+
+        const canPublish = canPublishEventAt(draftData, effectivePublishMs)
+        if (!canPublish.allowed) {
+          batch.update(draftSnap.ref, {
+            publishAt: Firestore.FieldValue.delete(),
+            publishAtTimezone: Firestore.FieldValue.delete(),
+            publishAtError: canPublish.reason,
+          })
+          skipped += 1
+          unscheduled += 1
+          ops += 1
+        }
+        else {
+          const publishedRef = db.collection('organizations').doc(orgId)
+            .collection('sites').doc(siteId)
+            .collection('published_posts').doc(postId)
+
+          const publishedAtMillis = Number.isFinite(effectivePublishMs) ? effectivePublishMs : nowMs
+          const publishedAtIso = new Date(publishedAtMillis).toISOString()
+          const publishPayload = { ...draftData }
+          delete publishPayload.publishAt
+          delete publishPayload.publishAtTimezone
+          publishPayload.doc_created_at = Number.isFinite(publishedAtMillis) ? publishedAtMillis : nowMs
+          publishPayload.publishAtError = ''
+          publishPayload.publishedAt = publishedAtIso
+
+          batch.set(publishedRef, publishPayload, { merge: false })
+          batch.update(draftSnap.ref, {
+            doc_created_at: Number.isFinite(publishedAtMillis) ? publishedAtMillis : nowMs,
+            publishedAt: publishedAtIso,
+            publishAt: Firestore.FieldValue.delete(),
+            publishAtTimezone: Firestore.FieldValue.delete(),
+            publishAtError: Firestore.FieldValue.delete(),
+          })
+          published += 1
+          unscheduled += 1
+          ops += 2
+        }
+
+        if (ops >= 400) {
+          await batch.commit()
+          batch = db.batch()
+          ops = 0
+        }
+      }
+
+      if (ops > 0)
+        await batch.commit()
+
+      lastDoc = snap.docs[snap.docs.length - 1]
+      if (snap.size < pageSize)
+        break
+    }
+
+    logger.log('publishScheduledPosts complete', {
+      scanned,
+      withSchedule,
+      published,
+      skipped,
+      unscheduled,
+      nowIso,
+    })
+  },
+)
+
+// start delete later
+exports.reindexPublishedPostsToKv = onCall({ timeoutSeconds: 540 }, async (request) => {
+  assertCallableUser(request)
+
+  const pageSize = 200
+  let scanned = 0
+  let rewritten = 0
+  let syncedPosts = 0
+  let lastDoc = null
+
+  for (;;) {
+    let query = db.collectionGroup('published_posts')
+      .orderBy(admin.firestore.FieldPath.documentId())
+      .limit(pageSize)
+
+    if (lastDoc)
+      query = query.startAfter(lastDoc)
+
+    const snap = await query.get()
+    if (snap.empty)
+      break
+
+    let batch = db.batch()
+    let ops = 0
+
+    for (const docSnap of snap.docs) {
+      scanned += 1
+      const currentSendToKv = Number(docSnap.get('sendToKV'))
+      const nextSendToKv = Number.isFinite(currentSendToKv) ? currentSendToKv + 1 : 1
+      batch.set(docSnap.ref, { sendToKV: nextSendToKv }, { merge: true })
+      const segments = String(docSnap.ref.path || '').split('/').filter(Boolean)
+      if (segments.length === 6 && segments[0] === 'organizations' && segments[2] === 'sites' && segments[4] === 'published_posts') {
+        const orgId = segments[1]
+        const siteId = segments[3]
+        const postId = segments[5]
+        const postRef = db.collection('organizations').doc(orgId).collection('sites').doc(siteId).collection('posts').doc(postId)
+        batch.set(postRef, { sendToKV: nextSendToKv }, { merge: true })
+        syncedPosts += 1
+        ops += 1
+      }
+      rewritten += 1
+      ops += 1
+
+      if (ops >= 400) {
+        await batch.commit()
+        batch = db.batch()
+        ops = 0
+      }
+    }
+
+    if (ops > 0)
+      await batch.commit()
+
+    lastDoc = snap.docs[snap.docs.length - 1]
+    if (snap.size < pageSize)
+      break
+  }
+
+  logger.log('reindexPublishedPostsToKv complete', { scanned, rewritten, syncedPosts })
+  return { ok: true, scanned, rewritten, syncedPosts }
+})
+// end delete later
 
 exports.onSiteWritten = createKvMirrorHandler({
   document: 'organizations/{orgId}/published-site-settings/{siteId}',
   makeCanonicalKey: ({ orgId, siteId }) =>
     `sites:${orgId}:${siteId}`,
-  makeIndexKeys: ({ orgId }, data) => {
+  makeIndexKeys: ({ orgId, siteId }, data) => {
     const keys = []
+    const siteDocId = slug(siteId)
+    if (siteDocId)
+      keys.push(`idx:sites:docId:${orgId}:${siteDocId}:${siteId}`)
     const domains = Array.isArray(data?.domains) ? data.domains : []
     for (const domain of domains) {
       const st = slug(domain)
@@ -2212,8 +2754,13 @@ exports.ensurePublishedSiteDomains = onDocumentWritten(
   { document: 'organizations/{orgId}/published-site-settings/{siteId}', timeoutSeconds: 180 },
   async (event) => {
     const change = event.data
-    if (!change?.after?.exists)
+    if (!change?.after?.exists) {
+      await cleanupOwnedPublishedSiteDomains(change?.before?.ref?.path, {
+        orgId: event.params.orgId,
+        siteId: event.params.siteId,
+      })
       return
+    }
 
     const orgId = event.params.orgId
     const siteId = event.params.siteId

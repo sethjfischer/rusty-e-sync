@@ -8,3 +8,8 @@ const { kvMirrorRetryWorker } = require('./kv/kvRetryWorker')
 exports.kvMirrorRetryWorker = kvMirrorRetryWorker
 exports.edgeFirebase = require('./edgeFirebase')
 // END @edge/firebase functions
+
+// START EXTRA EDGE functions
+exports.cms = require('./cms')
+exports.history = require('./history')
+// END EXTRA EDGE functions
