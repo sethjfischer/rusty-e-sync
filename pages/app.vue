@@ -56,6 +56,12 @@ const menuBuilder = () => {
           devOnly: true,
         },
         {
+          title: 'Products',
+          to: '/app/dashboard/products',
+          icon: 'Package',
+          devOnly: true,
+        },
+        {
           title: 'Blocks',
           to: '/app/dashboard/blocks',
           icon: 'Blocks',

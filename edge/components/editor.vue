@@ -72,7 +72,7 @@ const props = defineProps({
 const emit = defineEmits(['unsavedChanges', 'workingDoc', 'error', 'saved'])
 
 const newDoc = computed(() => {
-  return Object.entries(props.newDocSchema).reduce((newObj, [key, val]) => {
+  return Object.entries(props.newDocSchema || {}).reduce((newObj, [key, val]) => {
     newObj[key] = val.value
     return newObj
   }, {})

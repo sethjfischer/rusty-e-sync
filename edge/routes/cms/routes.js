@@ -20,10 +20,20 @@ export const cmsRoutes = [
     file: './edge/routes/cms/dashboard/media/index.vue',
   },
   {
+    name: 'cms-dashboard-products-doc',
+    path: '/app/dashboard/products/:docId?',
+    file: './edge/routes/cms/dashboard/products/[[docId]].vue',
+  },
+  {
     name: 'cms-dashboard-sites-site',
     path: '/app/dashboard/sites/:site',
     file: './edge/routes/cms/dashboard/sites/[site].vue',
     children: [
+      {
+        name: 'cms-dashboard-sites-site-products-doc',
+        path: 'products/:docId?',
+        file: './edge/routes/cms/dashboard/sites/[site]/products/[[docId]].vue',
+      },
       {
         name: 'cms-dashboard-sites-site-page',
         path: ':page',

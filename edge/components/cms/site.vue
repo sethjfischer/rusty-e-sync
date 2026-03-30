@@ -1,7 +1,7 @@
 <script setup lang="js">
 import { toTypedSchema } from '@vee-validate/zod'
 import * as z from 'zod'
-import { CircleAlert, Download, ExternalLink, File, FileCheck, FileCog, FileDown, FileMinus2, FilePen, FilePenLine, FileStack, FileUp, FileX, FolderCog, FolderDown, FolderUp, FolderX, Inbox, Loader2, Mail, MailOpen, MoreHorizontal, Plus, SlidersHorizontal, Trash2, Upload } from 'lucide-vue-next'
+import { CircleAlert, Download, ExternalLink, File, FileCheck, FileCog, FileDown, FileMinus2, FilePen, FilePenLine, FileStack, FileUp, FileX, FolderCog, FolderDown, FolderUp, FolderX, Inbox, Loader2, Mail, MailOpen, MoreHorizontal, Package, Plus, SlidersHorizontal, Trash2, Upload } from 'lucide-vue-next'
 import { useStructuredDataTemplates } from '@/edge/composables/structuredDataTemplates'
 
 const props = defineProps({
@@ -58,6 +58,7 @@ const isJsonInvalid = (value) => {
 
 const isTemplateSite = computed(() => props.site === 'templates')
 const router = useRouter()
+const route = useRoute()
 
 const SUBMISSION_IGNORE_FIELDS = new Set(['orgId', 'siteId', 'pageId', 'blockId'])
 const SUBMISSION_LABEL_KEYS = ['name', 'fullName', 'firstName', 'lastName', 'email', 'phone']
@@ -2089,6 +2090,7 @@ const _pageStatusLabel = pageId => (isPublishedPageDiff(pageId) ? 'Draft' : 'Pub
 const isEditingPage = computed(() => Boolean(props.page))
 const showSplitView = computed(() => !isEditingPage.value && (isTemplateSite.value || (canViewPagesTab.value && state.viewMode === 'pages')))
 const isEditingPost = computed(() => canViewPostsTab.value && state.viewMode === 'posts' && Boolean(state.selectedPostId))
+const isProductsRoute = computed(() => route.path.startsWith(`/app/dashboard/sites/${props.site}/products`))
 
 const ensureValidViewMode = () => {
   let nextMode = state.viewMode
@@ -2863,6 +2865,18 @@ const siteSettingsWorkingDocUpdates = (workingDoc) => {
               >
                 {{ unreadSubmissionsCount }}
               </span>
+            </edge-shad-button>
+            <edge-shad-button
+              variant="ghost"
+              size="sm"
+              class="h-8 px-4 text-xs gap-2 rounded-full"
+              :class="isProductsRoute
+                ? 'bg-gradient-to-r from-slate-900 to-slate-700 text-white hover:text-white shadow-sm dark:bg-gradient-to-r dark:from-slate-200 dark:to-slate-400 dark:text-slate-900 dark:hover:text-slate-900'
+                : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-slate-100'"
+              :to="`/app/dashboard/sites/${props.site}/products`"
+            >
+              <Package class="h-4 w-4" />
+              Products
             </edge-shad-button>
           </div>
         </div>

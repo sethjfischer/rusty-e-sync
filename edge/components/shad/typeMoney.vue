@@ -12,6 +12,7 @@ const props = defineProps({
   maskOptions: { type: [Object], default: null },
   disabled: { type: Boolean, default: false },
   modelValue: { type: [String, Number], default: '' },
+  showToggle: { type: Boolean, default: true },
 })
 
 const emits = defineEmits(['update:modelValue'])
@@ -43,6 +44,8 @@ watch(modelValue, (val) => {
 })
 
 const toggleDebit = () => {
+  if (!props.showToggle)
+    return
   state.isDebit = !state.isDebit
   if (modelValue.value !== '') {
     modelValue.value = state.isDebit
@@ -133,6 +136,7 @@ const formatDecimal = (event) => {
 
         <div class="flex items-center mb-2">
           <button
+            v-if="props.showToggle"
             type="button"
             class="border px-2 py-2 rounded text-sm w-[100px] bg-primary text-primary-foreground"
             @click="toggleDebit"

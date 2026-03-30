@@ -12,4 +12,5 @@ exports.edgeFirebase = require('./edgeFirebase')
 // START EXTRA EDGE functions
 exports.cms = require('./cms')
 exports.history = require('./history')
+exports.ebaySync = require('./ebaySync')
 // END EXTRA EDGE functions

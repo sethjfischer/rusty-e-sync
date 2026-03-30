@@ -983,6 +983,21 @@ watch(modelValue, () => {
         <edge-g-helper :title="props.label" :helper="props.helper" />
       </template>
     </edge-shad-tags>
+    <edge-shad-select-tags
+      v-if="props.fieldType === 'selectTags'"
+      v-model="modelValue"
+      :name="props.name"
+      :items="props.items"
+      :label="props.label"
+      :disabled="props.disabled"
+      :allow-additions="props.bindings['allow-additions'] !== false"
+      :placeholder="props.bindings?.placeholder || props.label"
+      class="w-full"
+    >
+      <template v-if="props.helper" #icon>
+        <edge-g-helper :title="props.label" :helper="props.helper" />
+      </template>
+    </edge-shad-select-tags>
     <template v-if="props.fieldType === 'object' || props.fieldType === 'array'">
       <edge-shad-dialog v-model="state.keyMenu">
         <DialogContent>
